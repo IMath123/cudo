@@ -127,6 +127,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \\
     build-essential \\
     mercurial \\
     subversion \\
+    tmux \\
     vim \\
     curl \\
     sudo \\
@@ -174,11 +175,14 @@ EOF
 generate_docker_compose() {
     local image_name=$1
     
+    # 从镜像名称生成服务名称（移除特殊字符）
+    local service_name=$(echo "${image_name}" | sed 's/[^a-zA-Z0-9_-]//g')
+    
     cat > "$DOCKER_COMPOSE_FILE" << EOF
 version: '3.8'
 
 services:
-  cuda-environment:
+  ${service_name}:
     build:
       context: .
       dockerfile: Dockerfile
@@ -203,6 +207,7 @@ services:
               capabilities: [gpu]
 EOF
     log_success "docker-compose.yml 已生成"
+    log_info "服务名称: ${service_name}"
 }
 
 # 构建镜像
@@ -210,7 +215,7 @@ build_image() {
     log_info "开始构建镜像..."
     cd "$CONFIG_DIR"
     
-    if docker-compose build; then
+    if docker_compose_cmd build; then
         log_success "镜像构建成功!"
         log_info "镜像名称: $IMAGE_NAME"
         log_info "工作目录: $PROJECT_ROOT"
@@ -225,10 +230,31 @@ check_image_exists() {
     docker image inspect "$1" > /dev/null 2>&1
 }
 
+# 获取服务名称
+get_service_name() {
+    local image_name=$1
+    echo "${image_name}" | sed 's/[^a-zA-Z0-9_-]//g'
+}
+
+# Docker Compose 命令兼容性处理
+docker_compose_cmd() {
+    # 优先使用 docker compose (V2)
+    if command -v docker > /dev/null && docker compose version > /dev/null 2>&1; then
+        docker compose "$@"
+    # 回退到 docker-compose (V1)
+    elif command -v docker-compose > /dev/null; then
+        docker-compose "$@"
+    else
+        log_error "未找到 docker compose 或 docker-compose 命令"
+        exit 1
+    fi
+}
+
 # 检查容器状态
 check_container_status() {
-    if docker ps -a --format "table {{.Names}}\t{{.Status}}" | grep -q "$1-container"; then
-        local status=$(docker ps -a --format "table {{.Names}}\t{{.Status}}" | grep "$1-container" | awk '{print $2}')
+    local container_name="$1-container"
+    if docker ps -a --format "table {{.Names}}\t{{.Status}}" | grep -q "$container_name"; then
+        local status=$(docker ps -a --format "table {{.Names}}\t{{.Status}}" | grep "$container_name" | awk '{print $2}')
         if [[ "$status" == Up* ]]; then
             echo "running"
         else
@@ -326,6 +352,7 @@ run_command() {
     fi
     
     local command=${1:-exec}
+    local service_name=$(get_service_name "$IMAGE_NAME")
     
     case $command in
         "status")
@@ -345,22 +372,22 @@ run_command() {
         "start")
             log_info "启动容器..."
             cd "$CONFIG_DIR"
-            docker-compose up -d
+            docker_compose_cmd up -d
             ;;
         "stop")
             log_info "停止容器..."
             cd "$CONFIG_DIR"
-            docker-compose down
+            docker_compose_cmd down
             ;;
         "restart")
             log_info "重启容器..."
             cd "$CONFIG_DIR"
-            docker-compose down
-            docker-compose up -d
+            docker_compose_cmd down
+            docker_compose_cmd up -d
             ;;
         "logs")
             cd "$CONFIG_DIR"
-            docker-compose logs -f
+            docker_compose_cmd logs -f
             ;;
         "exec"|"bash")
             local status=$(check_container_status "$IMAGE_NAME")
@@ -372,14 +399,14 @@ run_command() {
                 "stopped")
                     log_info "启动容器并进入..."
                     cd "$CONFIG_DIR"
-                    docker-compose up -d
+                    docker_compose_cmd up -d
                     sleep 2
                     docker exec -it "${IMAGE_NAME}-container" bash
                     ;;
                 "nonexistent")
                     log_info "创建并启动容器..."
                     cd "$CONFIG_DIR"
-                    docker-compose up -d
+                    docker_compose_cmd up -d
                     sleep 2
                     docker exec -it "${IMAGE_NAME}-container" bash
                     ;;
@@ -388,7 +415,7 @@ run_command() {
         "remove")
             log_info "清理容器和镜像..."
             cd "$CONFIG_DIR"
-            docker-compose down 2>/dev/null || true
+            docker_compose_cmd down 2>/dev/null || true
             docker rmi "$IMAGE_NAME" 2>/dev/null || true
             rm -rf "$CONFIG_DIR" 2>/dev/null || true
             log_success "已清理所有容器、镜像和配置文件"
