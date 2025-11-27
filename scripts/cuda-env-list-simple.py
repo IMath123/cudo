@@ -203,7 +203,7 @@ def main():
         
         # Format status based on config status and directory existence
         if config_status == 'deleted' or not config_dir_exists:
-            formatted_status = "deleted/moved"
+            formatted_status = "Deleted/Moved"
         else:
             formatted_status = status_display
         
