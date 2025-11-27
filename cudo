@@ -410,8 +410,8 @@ build_command() {
                 shift 2
                 ;;
             -t|--with-toolkit)
-                with_toolkit="$2"
-                shift 2
+                with_toolkit="true"
+                shift
                 ;;
             -p|--python-version)
                 python_version="$2"
@@ -652,7 +652,7 @@ Commands:
 Build options:
   -c, --cuda-version     CUDA version (default: $DEFAULT_CUDA_VERSION)
   -u, --ubuntu-version   Ubuntu version (default: $DEFAULT_UBUNTU_VERSION)
-  -t, --with-toolkit     Include CUDA Toolkit (true/false) (default: $DEFAULT_WITH_TOOLKIT)
+  -t, --with-toolkit     Include CUDA Toolkit (flag, no value needed) (default: $DEFAULT_WITH_TOOLKIT)
   -p, --python-version   Python version (default: $DEFAULT_PYTHON_VERSION)
   -i, --image-name       Image name (default: based on project name)
 
