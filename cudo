@@ -13,7 +13,8 @@ DEFAULT_CUDA_VERSION="12.4.0"
 DEFAULT_UBUNTU_VERSION="20.04"
 DEFAULT_WITH_TOOLKIT="false"
 DEFAULT_PYTHON_VERSION="3.10"
-DEFAULT_IMAGE_NAME="cuda-project-$(basename "$PROJECT_ROOT" | tr '[:upper:]' '[:lower:]')"
+# 注意：实际的镜像名称会在 build 时加上 UNIQUE_HASH
+DEFAULT_IMAGE_NAME_BASE="cuda-project-$(basename "$PROJECT_ROOT" | tr '[:upper:]' '[:lower:]')"
 
 CONFIG_DIR="$PROJECT_ROOT/.cudo"
 
@@ -32,13 +33,20 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Log Function
-log_info() { echo -e "${BLUE}ℹ️  $1${NC}"; }
-log_success() { echo -e "${GREEN}✅  $1${NC}"; }
-log_warning() { echo -e "${YELLOW}⚠️  $1${NC}"; }
-log_error() { echo -e "${RED}❌  $1${NC}"; }
+log_info() { echo -e "${BLUE}$1${NC}"; }
+log_success() { echo -e "${GREEN} $1${NC}"; }
+log_warning() { echo -e "${YELLOW}$1${NC}"; }
+log_error() { echo -e "${RED}$1${NC}"; }
 
 
 save_config() {
+    # 不在这里生成哈希，哈希应该在 build 时或检测到拷贝时生成
+    # 如果 UNIQUE_HASH 为空，说明配置有问题
+    if [ -z "$UNIQUE_HASH" ]; then
+        log_error "UNIQUE_HASH is not set. This should not happen."
+        exit 1
+    fi
+    
     cat > "$CONFIG_FILE" << EOF
 CUDA_VERSION=$CUDA_VERSION
 UBUNTU_VERSION=$UBUNTU_VERSION
@@ -46,21 +54,100 @@ WITH_TOOLKIT=$WITH_TOOLKIT
 PYTHON_VERSION=$PYTHON_VERSION
 IMAGE_NAME=$IMAGE_NAME
 CUDA_VARIANT=$CUDA_VARIANT
+UNIQUE_HASH=$UNIQUE_HASH
 EOF
     log_success "Configuration saved"
 }
 
 save_to_global() {
     local project_name=$(basename "$PROJECT_ROOT")
-    local project_path_hash=$(echo -n "$PROJECT_ROOT" | md5sum | cut -d' ' -f1 | head -c 8)
-    local unique_id="${project_name}-${project_path_hash}"
+    local unique_hash=$UNIQUE_HASH
+    local unique_id="${project_name}-${unique_hash}"
     local global_config_file="$GLOBAL_CONFIG_DIR/${unique_id}.conf"
     
-    # 检查是否已存在相同路径的配置
-    local existing_config=$(find "$GLOBAL_CONFIG_DIR" -name "*.conf" -exec grep -l "PROJECT_PATH=$PROJECT_ROOT$" {} \;)
+    # 获取当前项目目录的 inode
+    local current_inode=$(stat -c '%i' "$PROJECT_ROOT" 2>/dev/null || stat -f '%i' "$PROJECT_ROOT" 2>/dev/null)
     
-    if [ -n "$existing_config" ]; then
-        rm -f "$existing_config"
+    # 检查是否已存在相同路径的配置
+    local existing_config_by_path=$(find "$GLOBAL_CONFIG_DIR" -name "*.conf" -exec grep -l "PROJECT_PATH=$PROJECT_ROOT$" {} \; 2>/dev/null | head -1)
+    
+    if [ -n "$existing_config_by_path" ]; then
+        # 同一路径，只需更新配置，不删除
+        log_info "Updating existing configuration for current path"
+    fi
+    
+    # 检查是否已存在相同 unique_hash 的配置（但不同路径）
+    local existing_config_by_hash=$(find "$GLOBAL_CONFIG_DIR" -name "*.conf" -exec grep -l "UNIQUE_HASH=$unique_hash$" {} \; 2>/dev/null | head -1)
+    
+    if [ -n "$existing_config_by_hash" ]; then
+        # 获取原始项目路径
+        local original_project_path=$(grep "PROJECT_PATH=" "$existing_config_by_hash" | cut -d'=' -f2-)
+        
+        if [ "$original_project_path" != "$PROJECT_ROOT" ]; then
+            # 路径不同，需要判断是移动还是拷贝
+            
+            # 获取原始路径的 inode（如果路径仍然存在）
+            local original_inode=""
+            if [ -d "$original_project_path" ]; then
+                original_inode=$(stat -c '%i' "$original_project_path" 2>/dev/null || stat -f '%i' "$original_project_path" 2>/dev/null)
+            fi
+            
+            if [ -n "$original_inode" ] && [ "$original_inode" = "$current_inode" ]; then
+                # inode 相同 → 这是移动操作
+                log_info "Detected project move from $original_project_path to $PROJECT_ROOT"
+                log_info "Updating configuration with new path, keeping hash: $unique_hash"
+                # 删除旧配置文件
+                rm -f "$existing_config_by_hash"
+            elif [ -d "$original_project_path/.cudo" ]; then
+                # 原始路径存在且 inode 不同 → 这是拷贝操作
+                log_warning "=========================================="
+                log_warning "Detected project copy!"
+                log_warning "Original: $original_project_path"
+                log_warning "Copy: $PROJECT_ROOT"
+                log_warning "=========================================="
+                
+                # 生成新的唯一哈希
+                UNIQUE_HASH=$(openssl rand -hex 4)
+                unique_hash=$UNIQUE_HASH
+                unique_id="${project_name}-${unique_hash}"
+                global_config_file="$GLOBAL_CONFIG_DIR/${unique_id}.conf"
+                
+                # 更新镜像名称以包含新的哈希
+                # 从旧的 IMAGE_NAME 中提取基础名称（去掉旧哈希）
+                local old_hash=$(grep "UNIQUE_HASH=" "$existing_config_by_hash" | cut -d'=' -f2)
+                local image_name_base="${IMAGE_NAME%-$old_hash}"
+                IMAGE_NAME="${image_name_base}-${UNIQUE_HASH}"
+                
+                log_warning "Generated new unique hash: $unique_hash"
+                log_warning "New image name: $IMAGE_NAME"
+                log_warning ""
+                log_warning "IMPORTANT: You must rebuild the image for this copied project!"
+                log_warning "Run: cudo build"
+                log_warning "=========================================="
+                
+                # 更新本地配置文件
+                cat > "$CONFIG_FILE" << EOF
+CUDA_VERSION=$CUDA_VERSION
+UBUNTU_VERSION=$UBUNTU_VERSION
+WITH_TOOLKIT=$WITH_TOOLKIT
+PYTHON_VERSION=$PYTHON_VERSION
+IMAGE_NAME=$IMAGE_NAME
+CUDA_VARIANT=$CUDA_VARIANT
+UNIQUE_HASH=$UNIQUE_HASH
+EOF
+                log_success "Configuration saved with new hash"
+                
+                # 重新生成 docker-compose.yml 文件以使用新的服务名和镜像名
+                generate_docker_compose "$IMAGE_NAME"
+                log_info "Updated docker-compose.yml with new service name and image name"
+            else
+                # 原始路径不存在 → 这是移动操作（原路径已删除）
+                log_info "Original path no longer exists, treating as move operation"
+                log_info "Updating configuration with new path, keeping hash: $unique_hash"
+                # 删除旧配置文件
+                rm -f "$existing_config_by_hash"
+            fi
+        fi
     fi
     
     cat > "$global_config_file" << EOF
@@ -74,6 +161,7 @@ IMAGE_NAME=$IMAGE_NAME
 CUDA_VARIANT=$CUDA_VARIANT
 CREATED_TIME="$(date '+%Y-%m-%d %H:%M:%S')"
 LAST_UPDATED="$(date '+%Y-%m-%d %H:%M:%S')"
+UNIQUE_HASH=$unique_hash
 UNIQUE_ID=$unique_id
 STATUS=active
 EOF
@@ -81,9 +169,9 @@ EOF
 }
 
 remove_from_global() {
+    local unique_hash=$UNIQUE_HASH
     local project_name=$(basename "$PROJECT_ROOT")
-    local project_path_hash=$(echo -n "$PROJECT_ROOT" | md5sum | cut -d' ' -f1 | head -c 8)
-    local unique_id="${project_name}-${project_path_hash}"
+    local unique_id="${project_name}-${unique_hash}"
     local global_config_file="$GLOBAL_CONFIG_DIR/${unique_id}.conf"
     
     if [ -f "$global_config_file" ]; then
@@ -100,7 +188,7 @@ update_global_status() {
             source "$config_file"
             
             # 检查项目路径是否还存在容器配置文件夹
-            local config_dir="$PROJECT_PATH/.cuda-docker-config"
+            local config_dir="$PROJECT_PATH/.cudo"
             if [ ! -d "$config_dir" ]; then
                 # 标记为已删除或已移动
                 sed -i "s|STATUS=.*|STATUS=deleted|" "$config_file"
@@ -117,8 +205,8 @@ update_global_status() {
 # 清理旧的全局配置文件（基于项目名称的）
 cleanup_old_global_configs() {
     local project_name=$(basename "$PROJECT_ROOT")
-    local project_path_hash=$(echo -n "$PROJECT_ROOT" | md5sum | cut -d' ' -f1 | head -c 8)
-    local current_unique_id="${project_name}-${project_path_hash}"
+    local unique_hash=$UNIQUE_HASH
+    local current_unique_id="${project_name}-${unique_hash}"
     
     # 查找所有相同项目名称的旧配置文件
     for old_config in "$GLOBAL_CONFIG_DIR/${project_name}.conf"*; do
@@ -133,6 +221,11 @@ cleanup_old_global_configs() {
 load_config() {
     if [ -f "$CONFIG_FILE" ]; then
         source "$CONFIG_FILE"
+        # 如果配置中没有 UNIQUE_HASH，这是一个错误状态
+        if [ -z "$UNIQUE_HASH" ]; then
+            log_error "Configuration file is missing UNIQUE_HASH. Please rebuild the project."
+            return 1
+        fi
         return 0
     else
         return 1
@@ -257,8 +350,9 @@ EOF
 generate_docker_compose() {
     local image_name=$1
     
-    # 从镜像名称生成服务名称（移除特殊字符）
-    local service_name=$(echo "${image_name}" | sed 's/[^a-zA-Z0-9_-]//g')
+    # 使用唯一哈希生成所有名称，避免冲突
+    local service_name="cuda-project-${UNIQUE_HASH}"
+    local container_name="${service_name}-container"
     
     cat > "$DOCKER_COMPOSE_FILE" << EOF
 version: '3.8'
@@ -270,7 +364,7 @@ services:
       dockerfile: Dockerfile
     image: ${image_name}
     network_mode: host
-    container_name: ${image_name}-container
+    container_name: ${container_name}
     runtime: nvidia
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
@@ -290,6 +384,7 @@ services:
 EOF
     log_success "docker-compose.yml generated"
     log_info "Service name: ${service_name}"
+    log_info "Container name: ${container_name}"
 }
 
 # 构建镜像
@@ -309,7 +404,7 @@ build_image() {
 
 # 获取容器资源使用信息
 get_container_stats() {
-    local container_name="$1-container"
+    local container_name="cuda-project-${UNIQUE_HASH}-container"
     local stats_output
     
     if docker ps --format "table {{.Names}}" | grep -q "$container_name"; then
@@ -330,7 +425,7 @@ get_container_stats() {
 
 # 获取容器详细信息
 get_container_info() {
-    local container_name="$1-container"
+    local container_name="cuda-project-${UNIQUE_HASH}-container"
     local info_output
     
     if docker ps -a --format "table {{.Names}}" | grep -q "$container_name"; then
@@ -376,7 +471,7 @@ docker_compose_cmd() {
 
 # 检查容器状态
 check_container_status() {
-    local container_name="$1-container"
+    local container_name="cuda-project-${UNIQUE_HASH}-container"
     if docker ps -a --format "table {{.Names}}\t{{.Status}}" | grep -q "$container_name"; then
         local status=$(docker ps -a --format "table {{.Names}}\t{{.Status}}" | grep "$container_name" | awk '{print $2}')
         if [[ "$status" == Up* ]]; then
@@ -392,12 +487,20 @@ check_container_status() {
 # 构建命令
 build_command() {
     mkdir -p $CONFIG_DIR
+    
+    # 尝试加载现有配置以保留哈希
+    local existing_hash=""
+    if [ -f "$CONFIG_FILE" ]; then
+        source "$CONFIG_FILE"
+        existing_hash="$UNIQUE_HASH"
+    fi
+    
     # 解析构建参数
     local cuda_version=$DEFAULT_CUDA_VERSION
     local ubuntu_version=$DEFAULT_UBUNTU_VERSION
     local with_toolkit=$DEFAULT_WITH_TOOLKIT
     local python_version=$DEFAULT_PYTHON_VERSION
-    local image_name=$DEFAULT_IMAGE_NAME
+    local image_name_base=$DEFAULT_IMAGE_NAME_BASE
     
     while [[ $# -gt 0 ]]; do
         case $1 in
@@ -418,7 +521,7 @@ build_command() {
                 shift 2
                 ;;
             -i|--image-name)
-                image_name="$2"
+                image_name_base="$2"
                 shift 2
                 ;;
             *)
@@ -436,12 +539,22 @@ build_command() {
         local cuda_variant="base"
     fi
     
+    # 如果已有哈希则保留，否则生成新的（必须在设置 IMAGE_NAME 之前）
+    if [ -n "$existing_hash" ]; then
+        UNIQUE_HASH="$existing_hash"
+        log_info "Using existing hash: $UNIQUE_HASH"
+    else
+        UNIQUE_HASH=$(openssl rand -hex 4)
+        log_info "Generated new hash: $UNIQUE_HASH"
+    fi
+    
     # 设置全局变量用于保存配置
     CUDA_VERSION=$cuda_version
     UBUNTU_VERSION=$ubuntu_version
     WITH_TOOLKIT=$with_toolkit
     PYTHON_VERSION=$python_version
-    IMAGE_NAME=$image_name
+    # 镜像名称包含哈希值，确保每个项目有独立的镜像
+    IMAGE_NAME="${image_name_base}-${UNIQUE_HASH}"
     CUDA_VARIANT=$cuda_variant
     
     echo "Build configuration:"
@@ -451,6 +564,7 @@ build_command() {
     echo "  Python version: $PYTHON_VERSION"
     echo "  Image name: $IMAGE_NAME"
     echo "  Project path: $PROJECT_ROOT"
+    echo "  Unique hash: $UNIQUE_HASH"
     
     # 检查依赖
     check_dependencies
@@ -479,13 +593,16 @@ run_command() {
         exit 1
     fi
     
+    # 检查拷贝/移动并更新全局配置
+    # 这会在检测到拷贝时自动生成新哈希和新镜像名
+    save_to_global
+    
+    # 在检查拷贝后，再检查镜像是否存在
     if ! check_image_exists "$IMAGE_NAME"; then
-        log_error "Image '$IMAGE_NAME' does not exist, please run build command first: cudo build"
+        log_error "Image '$IMAGE_NAME' does not exist"
+        log_error "Please run build command first: cudo build"
         exit 1
     fi
-    
-    # 保存到全局配置（确保现有环境也被记录）
-    save_to_global
     
     local command=${1:-exec}
     local service_name=$(get_service_name "$IMAGE_NAME")
@@ -542,24 +659,25 @@ run_command() {
             ;;
         "exec"|"bash")
             local status=$(check_container_status "$IMAGE_NAME")
+            local container_name="cuda-project-${UNIQUE_HASH}-container"
             case $status in
                 "running")
                     log_info "Entering container..."
-                    docker exec -it "${IMAGE_NAME}-container" bash
+                    docker exec -it "$container_name" bash
                     ;;
                 "stopped")
                     log_info "Starting container and entering..."
                     cd "$CONFIG_DIR"
                     docker_compose_cmd up -d
                     sleep 2
-                    docker exec -it "${IMAGE_NAME}-container" bash
+                    docker exec -it "$container_name" bash
                     ;;
                 "nonexistent")
                     log_info "Creating and starting container..."
                     cd "$CONFIG_DIR"
                     docker_compose_cmd up -d
                     sleep 2
-                    docker exec -it "${IMAGE_NAME}-container" bash
+                    docker exec -it "$container_name" bash
                     ;;
             esac
             ;;
