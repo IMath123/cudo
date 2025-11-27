@@ -4,6 +4,8 @@
 # Usage: cudo [command] [options]
 
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# 如果 SCRIPT_DIR 指向的是主脚本所在目录，那么 Python 脚本应该在 scripts 子目录中
+PYTHON_SCRIPT_DIR="$SCRIPT_DIR/scripts"
 PROJECT_ROOT="$(pwd)"
 
 # Default Config
@@ -13,8 +15,7 @@ DEFAULT_WITH_TOOLKIT="false"
 DEFAULT_PYTHON_VERSION="3.10"
 DEFAULT_IMAGE_NAME="cuda-project-$(basename "$PROJECT_ROOT" | tr '[:upper:]' '[:lower:]')"
 
-CONFIG_DIR="$PROJECT_ROOT/.cuda-docker-config"
-mkdir -p $CONFIG_DIR
+CONFIG_DIR="$PROJECT_ROOT/.cudo"
 
 CONFIG_FILE="$CONFIG_DIR/config"
 DOCKERFILE="$CONFIG_DIR/Dockerfile"
@@ -72,7 +73,9 @@ PYTHON_VERSION=$PYTHON_VERSION
 IMAGE_NAME=$IMAGE_NAME
 CUDA_VARIANT=$CUDA_VARIANT
 CREATED_TIME="$(date '+%Y-%m-%d %H:%M:%S')"
+LAST_UPDATED="$(date '+%Y-%m-%d %H:%M:%S')"
 UNIQUE_ID=$unique_id
+STATUS=active
 EOF
     log_success "Configuration saved to global storage: $unique_id"
 }
@@ -87,6 +90,28 @@ remove_from_global() {
         rm -f "$global_config_file"
         log_success "Removed from global storage: $unique_id"
     fi
+}
+
+# 检查并更新全局配置状态
+update_global_status() {
+    # 遍历所有全局配置文件
+    for config_file in "$GLOBAL_CONFIG_DIR"/*.conf; do
+        if [ -f "$config_file" ]; then
+            source "$config_file"
+            
+            # 检查项目路径是否还存在容器配置文件夹
+            local config_dir="$PROJECT_PATH/.cuda-docker-config"
+            if [ ! -d "$config_dir" ]; then
+                # 标记为已删除或已移动
+                sed -i "s|STATUS=.*|STATUS=deleted|" "$config_file"
+                sed -i "s|LAST_UPDATED=.*|LAST_UPDATED=\"$(date '+%Y-%m-%d %H:%M:%S')\"|" "$config_file"
+            else
+                # 确保状态是 active
+                sed -i "s|STATUS=.*|STATUS=active|" "$config_file"
+                sed -i "s|LAST_UPDATED=.*|LAST_UPDATED=\"$(date '+%Y-%m-%d %H:%M:%S')\"|" "$config_file"
+            fi
+        fi
+    done
 }
 
 # 清理旧的全局配置文件（基于项目名称的）
@@ -366,6 +391,7 @@ check_container_status() {
 
 # 构建命令
 build_command() {
+    mkdir -p $CONFIG_DIR
     # 解析构建参数
     local cuda_version=$DEFAULT_CUDA_VERSION
     local ubuntu_version=$DEFAULT_UBUNTU_VERSION
@@ -446,6 +472,8 @@ build_command() {
 
 # 运行命令
 run_command() {
+    mkdir -p $CONFIG_DIR
+
     if ! load_config; then
         log_error "Configuration file not found, please run build command first: cudo build"
         exit 1
@@ -587,10 +615,12 @@ list_command() {
     local show_gpu=${2:-false}
     
     # 使用简化版本的 Python 脚本来显示表格
-    local python_script="$SCRIPT_DIR/scripts/cuda-env-list-simple.py"
+    local python_script="$PYTHON_SCRIPT_DIR/cuda-env-list-simple.py"
     
     if [ ! -f "$python_script" ]; then
         log_error "Python list script not found: $python_script"
+        log_info "Please ensure the Python script is installed in the correct location"
+        log_info "Expected location: $PYTHON_SCRIPT_DIR/cuda-env-list-simple.py"
         return 1
     fi
     
@@ -657,6 +687,9 @@ EOF
 main() {
     local command=$1
     shift
+    
+    # 每次执行命令时都更新全局状态
+    update_global_status
     
     case $command in
         "build")

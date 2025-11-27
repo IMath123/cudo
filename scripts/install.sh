@@ -12,10 +12,10 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-log_info() { echo -e "${BLUE}ℹ️  $1${NC}"; }
-log_success() { echo -e "${GREEN}✅  $1${NC}"; }
-log_warning() { echo -e "${YELLOW}⚠️  $1${NC}"; }
-log_error() { echo -e "${RED}❌  $1${NC}"; }
+log_info() { echo -e "${BLUE}$1${NC}"; }
+log_success() { echo -e "${GREEN} $1${NC}"; }
+log_warning() { echo -e "${YELLOW}$1${NC}"; }
+log_error() { echo -e "${RED}$1${NC}"; }
 
 # Check if running as root
 if [ "$EUID" -eq 0 ]; then
@@ -71,7 +71,7 @@ check_dependencies() {
 # Install system-wide
 install_system_wide() {
     local install_dir="/usr/local/bin"
-    local script_name="cuda-env"
+    local script_name="cudo"
     
     log_info "Installing to $install_dir..."
     
@@ -110,7 +110,7 @@ install_local() {
     cp "$PROJECT_ROOT/scripts/cuda-env-list-simple.py" "$scripts_dir/"
     
     # Update script path in main script
-    sed -i "s|SCRIPT_DIR=.*|SCRIPT_DIR=\"$scripts_dir\"|" "$install_dir/cuda-env"
+    sed -i "s|SCRIPT_DIR=.*|SCRIPT_DIR=\"$scripts_dir\"|" "$install_dir/cudo"
     
     log_success "Installed cudo to $install_dir"
     log_success "Support files installed to $scripts_dir"

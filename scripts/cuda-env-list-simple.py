@@ -115,7 +115,7 @@ def load_config(config_file):
     except Exception:
         return None
 
-def shorten_path(path, max_length=40):
+def shorten_path(path, max_length=80):
     """Shorten path display"""
     home = str(Path.home())
     short_path = path.replace(home, '~')
@@ -169,7 +169,7 @@ def get_system_memory():
         return 'N/A'
 
 def main():
-    global_config_dir = Path.home() / '.cuda-env-global'
+    global_config_dir = Path.home() / '.cudo-global'
     
     if not global_config_dir.exists() or not any(global_config_dir.glob('*.conf')):
         print("No CUDA environment configurations found")
@@ -190,9 +190,20 @@ def main():
         project_name = config.get('PROJECT_NAME', 'Unknown')
         image_name = config.get('IMAGE_NAME', '')
         container_name = f"{image_name}-container"
+        project_path = config.get('PROJECT_PATH', 'N/A')
+        config_status = config.get('STATUS', 'active')
+        
+        # Check if project directory still exists
+        config_dir_exists = os.path.exists(os.path.join(project_path, '.cudo'))
         
         # Get container status
         status_code, status_display = get_container_status(container_name)
+        
+        # Format status based on config status and directory existence
+        if config_status == 'deleted' or not config_dir_exists:
+            formatted_status = "deleted/moved"
+        else:
+            formatted_status = status_display
         
         # Get resource usage (only in detailed mode)
         cpu_usage, mem_usage = get_container_stats(container_name) if show_details else ('', '')
@@ -206,12 +217,13 @@ def main():
             'cuda_version': config.get('CUDA_VERSION', 'N/A'),
             'ubuntu_version': config.get('UBUNTU_VERSION', 'N/A'),
             'python_version': config.get('PYTHON_VERSION', 'N/A'),
-            'status': status_display,
-            'project_path': config.get('PROJECT_PATH', 'N/A'),
+            'status': formatted_status,
+            'project_path': project_path,
             'cpu_usage': cpu_usage,
             'mem_usage': mem_usage,
             'gpu_memory': gpu_memory,
-            'created_time': config.get('CREATED_TIME', 'N/A').strip('"')
+            'created_time': config.get('CREATED_TIME', 'N/A').strip('"'),
+            'last_updated': config.get('LAST_UPDATED', 'N/A').strip('"')
         }
         
         environments.append(env_info)
@@ -288,7 +300,7 @@ def main():
     print(f"\nStatistics:")
     print(f"  Total environments: {total_count}")
     print(f"  Running: {running_count}")
-    print(f"  System memory: {system_memory}")
+    # print(f"  System memory: {system_memory}")
     # print(f"  Global config directory: {global_config_dir}")
 
 if __name__ == '__main__':

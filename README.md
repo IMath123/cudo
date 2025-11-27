@@ -27,26 +27,36 @@ A powerful command-line tool for managing CUDA development environments using Do
 
 ## 🛠️ Installation
 
-### Quick Install
-```bash
-# Download the script
-curl -O https://raw.githubusercontent.com/yourusername/cudo/main/cudo
-chmod +x cudo
+For detailed installation instructions, please see the [INSTALL.md](INSTALL.md) file.
 
-# Or clone the repository
-git clone https://github.com/yourusername/cudo.git
+### Quick Start (Recommended)
+```bash
+# Clone the repository
+git clone https://github.com/IMath123/cudo.git
 cd cudo
+
+# Install locally (recommended for single user)
+./scripts/install.sh local
+
+# Test the installation
+cudo --help
 ```
 
 ### System-wide Installation
 ```bash
-# Install to /usr/local/bin
-sudo cp cudo /usr/local/bin/cudo
-sudo chmod +x /usr/local/bin/cudo
+# Clone the repository
+git clone https://github.com/IMath123/cudo.git
+cd cudo
 
-# Now you can use it from anywhere
+# Install system-wide (requires sudo)
+./scripts/install.sh system
+
+# Test the installation
 cudo --help
 ```
+
+### Manual Installation
+If you prefer manual installation, see [INSTALL.md](INSTALL.md) for step-by-step instructions.
 
 ## 🎯 Quick Start
 
