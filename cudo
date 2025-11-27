@@ -202,6 +202,33 @@ update_global_status() {
     done
 }
 
+# 清理已删除/移动的项目配置
+cleanup_deleted_projects() {
+    local deleted_count=0
+    
+    # 遍历所有全局配置文件
+    for config_file in "$GLOBAL_CONFIG_DIR"/*.conf; do
+        if [ -f "$config_file" ]; then
+            local status=$(grep "STATUS=" "$config_file" | cut -d'=' -f2)
+            
+            if [ "$status" = "deleted" ]; then
+                local project_name=$(grep "PROJECT_NAME=" "$config_file" | cut -d'=' -f2)
+                local unique_id=$(grep "UNIQUE_ID=" "$config_file" | cut -d'=' -f2)
+                
+                rm -f "$config_file"
+                deleted_count=$((deleted_count + 1))
+                log_info "Removed deleted project: $unique_id"
+            fi
+        fi
+    done
+    
+    if [ $deleted_count -eq 0 ]; then
+        log_info "No deleted projects to clean up"
+    else
+        log_success "Cleaned up $deleted_count deleted project(s)"
+    fi
+}
+
 # 清理旧的全局配置文件（基于项目名称的）
 cleanup_old_global_configs() {
     local project_name=$(basename "$PROJECT_ROOT")
@@ -599,8 +626,19 @@ run_command() {
     
     # 在检查拷贝后，再检查镜像是否存在
     if ! check_image_exists "$IMAGE_NAME"; then
-        log_error "Image '$IMAGE_NAME' does not exist"
-        log_error "Please run build command first: cudo build"
+        log_error "=========================================="
+        log_error "Environment is broken!"
+        log_error "=========================================="
+        log_error "Image '$IMAGE_NAME' does not exist."
+        log_error ""
+        log_error "This usually happens when:"
+        log_error "  1. The project was moved and the old image was deleted"
+        log_error "  2. The image was manually removed"
+        log_error "  3. Docker was reset/cleaned"
+        log_error ""
+        log_error "To fix this, rebuild the environment:"
+        log_error "  cudo build"
+        log_error "=========================================="
         exit 1
     fi
     
@@ -765,6 +803,7 @@ Commands:
   run [subcommand]   Run and manage containers
   config             Show current configuration
   list [options]     List all CUDA environments
+  cleanup            Clean up deleted/moved project configurations
   help               Show this help message
 
 Build options:
@@ -797,6 +836,7 @@ Examples:
   cudo config
   cudo list
   cudo list --details
+  cudo cleanup
   cudo run remove
 EOF
 }
@@ -856,6 +896,9 @@ main() {
                 esac
             done
             list_command "$show_details" "$show_gpu"
+            ;;
+        "cleanup")
+            cleanup_deleted_projects
             ;;
         "help"|"-h"|"--help"|"")
             usage
