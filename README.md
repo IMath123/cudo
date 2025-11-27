@@ -104,28 +104,25 @@ cudo build -i my-custom-image
 cudo run
 
 # Check container status
-cudo run status
+cudo status
 
 # Start container
-cudo run start
+cudo start
 
 # Stop container
-cudo run stop
+cudo stop
 
 # Restart container
-cudo run restart
+cudo restart
 
 # Reset container (delete and recreate)
-cudo run reset
+cudo reset
 
 # View logs
-cudo run logs
-
-# Enter running container
-cudo run exec
+cudo logs
 
 # Remove everything (container, image, config)
-cudo run remove
+cudo remove
 ```
 
 ### List Command

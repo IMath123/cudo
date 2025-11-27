@@ -611,7 +611,7 @@ build_command() {
     save_to_global
 }
 
-# 运行命令
+# 运行命令（进入容器）
 run_command() {
     mkdir -p $CONFIG_DIR
 
@@ -642,108 +642,172 @@ run_command() {
         exit 1
     fi
     
-    local command=${1:-exec}
-    local service_name=$(get_service_name "$IMAGE_NAME")
-    
-    case $command in
-        "status")
-            local status=$(check_container_status "$IMAGE_NAME")
-            case $status in
-                "running")
-                    log_success "Container is running"
-                    ;;
-                "stopped")
-                    log_warning "Container is stopped"
-                    ;;
-                "nonexistent")
-                    log_info "Container does not exist"
-                    ;;
-            esac
+    local status=$(check_container_status "$IMAGE_NAME")
+    local container_name="cuda-project-${UNIQUE_HASH}-container"
+    case $status in
+        "running")
+            log_info "Entering container..."
+            docker exec -it "$container_name" bash
             ;;
-        "start")
-            log_info "Starting container..."
+        "stopped")
+            log_info "Starting container and entering..."
             cd "$CONFIG_DIR"
             docker_compose_cmd up -d
+            sleep 2
+            docker exec -it "$container_name" bash
             ;;
-        "stop")
-            log_info "Stopping container..."
+        "nonexistent")
+            log_info "Creating and starting container..."
             cd "$CONFIG_DIR"
-            docker_compose_cmd down
-            ;;
-        "restart")
-            log_info "Restarting container..."
-            cd "$CONFIG_DIR"
-            docker_compose_cmd restart
-            ;;
-        "reset")
-            log_warning "This will reset the container (delete and recreate)"
-            log_warning "Project: $PROJECT_ROOT"
-            log_warning "Image: $IMAGE_NAME"
-            echo
-            read -p "Confirm reset? Enter 'y' to continue: " confirm
-            if [ "$confirm" != "y" ]; then
-                log_info "Operation cancelled"
-                exit 0
-            fi
-            
-            log_info "Resetting container (delete and recreate)..."
-            cd "$CONFIG_DIR"
-            docker_compose_cmd down
             docker_compose_cmd up -d
-            ;;
-        "logs")
-            cd "$CONFIG_DIR"
-            docker_compose_cmd logs -f
-            ;;
-        "exec"|"bash")
-            local status=$(check_container_status "$IMAGE_NAME")
-            local container_name="cuda-project-${UNIQUE_HASH}-container"
-            case $status in
-                "running")
-                    log_info "Entering container..."
-                    docker exec -it "$container_name" bash
-                    ;;
-                "stopped")
-                    log_info "Starting container and entering..."
-                    cd "$CONFIG_DIR"
-                    docker_compose_cmd up -d
-                    sleep 2
-                    docker exec -it "$container_name" bash
-                    ;;
-                "nonexistent")
-                    log_info "Creating and starting container..."
-                    cd "$CONFIG_DIR"
-                    docker_compose_cmd up -d
-                    sleep 2
-                    docker exec -it "$container_name" bash
-                    ;;
-            esac
-            ;;
-        "remove")
-            log_warning "This will delete the container, image, and all configuration files"
-            log_warning "Project: $PROJECT_ROOT"
-            log_warning "Image: $IMAGE_NAME"
-            echo
-            read -p "Confirm deletion? Enter 'y' to continue: " confirm
-            if [ "$confirm" != "y" ]; then
-                log_info "Operation cancelled"
-                exit 0
-            fi
-            
-            log_info "Cleaning up container and image..."
-            cd "$CONFIG_DIR"
-            docker_compose_cmd down 2>/dev/null || true
-            docker rmi "$IMAGE_NAME" 2>/dev/null || true
-            rm -rf "$CONFIG_DIR" 2>/dev/null || true
-            remove_from_global
-            log_success "All containers, images, and configuration files cleaned up"
-            ;;
-        *)
-            log_error "Unknown run command: $command"
-            usage
-            exit 1
+            sleep 2
+            docker exec -it "$container_name" bash
             ;;
     esac
+}
+
+# 状态命令
+status_command() {
+    mkdir -p $CONFIG_DIR
+
+    if ! load_config; then
+        log_error "Configuration file not found, please run build command first: cudo build"
+        exit 1
+    fi
+    
+    save_to_global
+    
+    local status=$(check_container_status "$IMAGE_NAME")
+    case $status in
+        "running")
+            log_success "Container is running"
+            ;;
+        "stopped")
+            log_warning "Container is stopped"
+            ;;
+        "nonexistent")
+            log_info "Container does not exist"
+            ;;
+    esac
+}
+
+# 启动命令
+start_command() {
+    mkdir -p $CONFIG_DIR
+
+    if ! load_config; then
+        log_error "Configuration file not found, please run build command first: cudo build"
+        exit 1
+    fi
+    
+    save_to_global
+    
+    log_info "Starting container..."
+    cd "$CONFIG_DIR"
+    docker_compose_cmd start
+}
+
+# 停止命令
+stop_command() {
+    mkdir -p $CONFIG_DIR
+
+    if ! load_config; then
+        log_error "Configuration file not found, please run build command first: cudo build"
+        exit 1
+    fi
+    
+    save_to_global
+    
+    log_info "Stopping container..."
+    cd "$CONFIG_DIR"
+    docker_compose_cmd stop
+}
+
+# 重启命令
+restart_command() {
+    mkdir -p $CONFIG_DIR
+
+    if ! load_config; then
+        log_error "Configuration file not found, please run build command first: cudo build"
+        exit 1
+    fi
+    
+    save_to_global
+    
+    log_info "Restarting container..."
+    cd "$CONFIG_DIR"
+    docker_compose_cmd restart
+}
+
+# 重置命令
+reset_command() {
+    mkdir -p $CONFIG_DIR
+
+    if ! load_config; then
+        log_error "Configuration file not found, please run build command first: cudo build"
+        exit 1
+    fi
+    
+    save_to_global
+    
+    log_warning "This will reset the container (delete and recreate)"
+    log_warning "Project: $PROJECT_ROOT"
+    log_warning "Image: $IMAGE_NAME"
+    echo
+    read -p "Confirm reset? Enter 'y' to continue: " confirm
+    if [ "$confirm" != "y" ]; then
+        log_info "Operation cancelled"
+        exit 0
+    fi
+    
+    log_info "Resetting container (delete and recreate)..."
+    cd "$CONFIG_DIR"
+    docker_compose_cmd down
+}
+
+# 日志命令
+logs_command() {
+    mkdir -p $CONFIG_DIR
+
+    if ! load_config; then
+        log_error "Configuration file not found, please run build command first: cudo build"
+        exit 1
+    fi
+    
+    save_to_global
+    
+    cd "$CONFIG_DIR"
+    docker_compose_cmd logs -f
+}
+
+# 删除命令
+remove_command() {
+    mkdir -p $CONFIG_DIR
+
+    if ! load_config; then
+        log_error "Configuration file not found, please run build command first: cudo build"
+        exit 1
+    fi
+    
+    save_to_global
+    
+    log_warning "This will delete the container, image, and all configuration files"
+    log_warning "Project: $PROJECT_ROOT"
+    log_warning "Image: $IMAGE_NAME"
+    echo
+    read -p "Confirm deletion? Enter 'y' to continue: " confirm
+    if [ "$confirm" != "y" ]; then
+        log_info "Operation cancelled"
+        exit 0
+    fi
+    
+    log_info "Cleaning up container and image..."
+    cd "$CONFIG_DIR"
+    docker_compose_cmd down 2>/dev/null || true
+    docker rmi "$IMAGE_NAME" 2>/dev/null || true
+    rm -rf "$CONFIG_DIR" 2>/dev/null || true
+    remove_from_global
+    log_success "All containers, images, and configuration files cleaned up"
 }
 
 # 配置命令
@@ -802,7 +866,14 @@ Usage: cudo <command> [options]
 
 Commands:
   build [options]    Build CUDA environment image
-  run [subcommand]   Run and manage containers
+  run                Start and enter container
+  status             Check container status
+  start              Start container
+  stop               Stop container
+  restart            Restart container (preserve state)
+  reset              Reset container (delete and recreate)
+  logs               View container logs
+  remove             Delete container, image and configuration files
   config             Show current configuration
   list [options]     List all CUDA environments
   cleanup            Clean up deleted/moved project configurations
@@ -815,17 +886,6 @@ Build options:
   -p, --python-version   Python version (default: $DEFAULT_PYTHON_VERSION)
   -i, --image-name       Image name (default: based on project name)
 
-Run subcommands:
-  (no subcommand)    Start and enter container
-  status             Check container status
-  start              Start container
-  stop               Stop container
-  restart            Restart container (preserve state)
-  reset              Reset container (delete and recreate)
-  logs               View container logs
-  exec               Enter container
-  remove             Delete container, image and configuration files
-
 List options:
   -d, --details      Show detailed resource information (CPU, memory usage, etc.)
   -g, --gpu          Show GPU memory usage information
@@ -833,13 +893,13 @@ List options:
 Examples:
   cudo build -c 11.8.0 -p 3.8
   cudo run
-  cudo run status
-  cudo run logs
+  cudo status
+  cudo logs
   cudo config
   cudo list
   cudo list --details
   cudo cleanup
-  cudo run remove
+  cudo remove
 EOF
 }
 
@@ -859,22 +919,28 @@ main() {
             run_command "$@"
             ;;
         "logs")
-            run_command logs
+            logs_command "$@"
             ;;
         "remove")
-            run_command remove
+            remove_command "$@"
+            ;;
+        "start")
+            start_command "$@"
+            ;;
+        "stop")
+            stop_command "$@"
             ;;
         "restart")
-            run_command restart
+            restart_command "$@"
             ;;
         "reset")
-            run_command reset
+            reset_command "$@"
             ;;
         "status")
-            run_command status
+            status_command "$@"
             ;;
         "exec")
-            run_command exec
+            run_command "$@"
             ;;
         "config")
             config_command
