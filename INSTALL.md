@@ -10,7 +10,7 @@ git clone https://github.com/IMath123/cudo.git
 cd cudo
 
 # Run the installation script
-./scripts/install.sh local
+./install.sh local
 
 # Test the installation
 cudo --help
@@ -51,7 +51,7 @@ git clone https://github.com/IMath123/cudo.git
 cd cudo
 
 # Install system-wide (requires sudo)
-./scripts/install.sh system
+./install.sh system
 
 # Test the installation
 cudo --help
@@ -99,7 +99,7 @@ If you see an error like "Python list script not found", check:
    # Remove and reinstall
    rm -f ~/.local/bin/cudo
    rm -rf ~/.local/share/cudo
-   ./scripts/install.sh local
+   ./install.sh local
    ```
 
 ### PATH Issues

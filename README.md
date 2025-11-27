@@ -36,7 +36,7 @@ git clone https://github.com/IMath123/cudo.git
 cd cudo
 
 # Install locally (recommended for single user)
-./scripts/install.sh local
+./install.sh local
 
 # Test the installation
 cudo --help
@@ -49,7 +49,7 @@ git clone https://github.com/IMath123/cudo.git
 cd cudo
 
 # Install system-wide (requires sudo)
-./scripts/install.sh system
+./install.sh system
 
 # Test the installation
 cudo --help
@@ -104,19 +104,19 @@ cudo build -i my-custom-image
 cudo run
 
 # Check container status
-cudo run status
+cudo status
 
 # Start container
-cudo run start
+cudo start
 
 # Stop container
-cudo run stop
+cudo stop
 
 # View logs
-cudo run logs
+cudo logs
 
-# Remove everything
-cudo run remove
+# Remove everything in current dir
+cudo remove
 ```
 
 ### List Command
@@ -229,7 +229,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 - **Issues**: [GitHub Issues](https://github.com/yourusername/cudo/issues)
 - **Discussions**: [GitHub Discussions](https://github.com/yourusername/cudo/discussions)
-- **Email**: your-email@example.com
+- **Email**: imatphy@gmail.com
 
 ---
 
