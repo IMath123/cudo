@@ -511,6 +511,53 @@ check_container_status() {
     fi
 }
 
+# 验证镜像名称
+validate_image_name() {
+    local image_name=$1
+    
+    # Docker 镜像名称规则：
+    # - 只能包含小写字母、数字、连字符、下划线和点号
+    # - 不能以连字符、下划线或点号开头或结尾
+    # - 不能包含连续的点号
+    
+    # 检查是否只包含允许的字符
+    if ! [[ "$image_name" =~ ^[a-z0-9._-]+$ ]]; then
+        log_error "Invalid image name: '$image_name'"
+        log_error "Image names can only contain lowercase letters, numbers, dots, hyphens, and underscores"
+        return 1
+    fi
+    
+    # 检查开头字符
+    if [[ "$image_name" =~ ^[._-] ]]; then
+        log_error "Invalid image name: '$image_name'"
+        log_error "Image names cannot start with a dot, hyphen, or underscore"
+        return 1
+    fi
+    
+    # 检查结尾字符
+    if [[ "$image_name" =~ [._-]$ ]]; then
+        log_error "Invalid image name: '$image_name'"
+        log_error "Image names cannot end with a dot, hyphen, or underscore"
+        return 1
+    fi
+    
+    # 检查连续的点号
+    if [[ "$image_name" =~ \.\. ]]; then
+        log_error "Invalid image name: '$image_name'"
+        log_error "Image names cannot contain consecutive dots"
+        return 1
+    fi
+    
+    # 检查长度（Docker 限制为 128 个字符）
+    if [ ${#image_name} -gt 128 ]; then
+        log_error "Invalid image name: '$image_name'"
+        log_error "Image names cannot exceed 128 characters"
+        return 1
+    fi
+    
+    return 0
+}
+
 # 构建命令
 build_command() {
     mkdir -p $CONFIG_DIR
@@ -549,6 +596,21 @@ build_command() {
                 ;;
             -i|--image-name)
                 image_name_base="$2"
+                # 立即验证镜像名称
+                if ! validate_image_name "$image_name_base"; then
+                    log_error ""
+                    log_error "Valid image name examples:"
+                    log_error "  my-project"
+                    log_error "  cuda-env-1"
+                    log_error "  test.image_123"
+                    log_error ""
+                    log_error "Invalid image name examples:"
+                    log_error "  My-Project (uppercase not allowed)"
+                    log_error "  -project (cannot start with hyphen)"
+                    log_error "  project. (cannot end with dot)"
+                    log_error "  project..name (consecutive dots not allowed)"
+                    exit 1
+                fi
                 shift 2
                 ;;
             *)
