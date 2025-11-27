@@ -92,7 +92,7 @@ cudo build
 cudo build -c 11.8.0 -p 3.8
 
 # With CUDA Toolkit
-cudo build -t true
+cudo build -t
 
 # Custom image name
 cudo build -i my-custom-image
@@ -104,19 +104,28 @@ cudo build -i my-custom-image
 cudo run
 
 # Check container status
-cudo status
+cudo run status
 
 # Start container
-cudo start
+cudo run start
 
 # Stop container
-cudo stop
+cudo run stop
+
+# Restart container
+cudo run restart
+
+# Reset container (delete and recreate)
+cudo run reset
 
 # View logs
-cudo logs
+cudo run logs
 
-# Remove everything in current dir
-cudo remove
+# Enter running container
+cudo run exec
+
+# Remove everything (container, image, config)
+cudo run remove
 ```
 
 ### List Command
@@ -130,6 +139,14 @@ cudo list --details
 # GPU memory information
 cudo list --gpu
 ```
+
+### Cleanup Command
+```bash
+# Clean up deleted/moved project configurations
+cudo cleanup
+```
+
+This command removes project configurations that are marked as deleted in the global registry, helping keep your environment list clean.
 
 ## 🔧 Configuration Options
 
@@ -159,7 +176,7 @@ Statistics:
 ## 🏗️ Project Structure
 
 ```
-.cuda-docker-config/          # Docker configuration for project
+.cudo/                       # Docker configuration for project
 ├── Dockerfile               # Generated Dockerfile with CUDA support
 ├── docker-compose.yml       # Docker Compose configuration
 └── config                   # Project settings
@@ -203,6 +220,19 @@ sudo systemctl restart docker
 # Add user to docker group
 sudo usermod -aG docker $USER
 # Log out and log back in
+```
+
+**Environment is broken (image missing)**
+```bash
+# This happens when the Docker image was deleted but the project still exists
+# Simply rebuild the environment:
+cudo build
+```
+
+**Too many deleted projects in list**
+```bash
+# Clean up deleted/moved project configurations
+cudo cleanup
 ```
 
 ## 🤝 Contributing

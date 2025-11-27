@@ -755,13 +755,15 @@ config_command() {
         echo "  CUDA variant: $CUDA_VARIANT"
         echo "  Python version: $PYTHON_VERSION"
         echo "  Image name: $IMAGE_NAME"
+        echo "  Unique hash: $UNIQUE_HASH"
     else
         log_info "No configuration found, using defaults:"
         echo "  CUDA version: $DEFAULT_CUDA_VERSION"
         echo "  Ubuntu version: $DEFAULT_UBUNTU_VERSION"
-        echo "  CUDA variant: runtime"
+        echo "  CUDA variant: base"
         echo "  Python version: $DEFAULT_PYTHON_VERSION"
-        echo "  Image name: $DEFAULT_IMAGE_NAME"
+        echo "  Image name base: $DEFAULT_IMAGE_NAME_BASE"
+        echo "  Note: Actual image name will include a unique hash after build"
     fi
 }
 
