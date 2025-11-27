@@ -105,7 +105,7 @@ cudo reset
 # View logs
 cudo logs
 
-# Remove everything (container, image, config)
+# Remove everything in current project (container, image, config)
 cudo remove
 ```
 
