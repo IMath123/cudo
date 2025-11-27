@@ -87,46 +87,18 @@ install_system_wide() {
     # Update script path in main script
     sudo sed -i "s|SCRIPT_DIR=.*|SCRIPT_DIR=\"$scripts_dir\"|" "$install_dir/$script_name"
     
+    # Create global configuration directory
+    local global_config_dir="/var/lib/cudo-global"
+    sudo mkdir -p "$global_config_dir"
+    sudo chmod 777 "$global_config_dir"
+    
     log_success "Installed $script_name to $install_dir"
     log_success "Support files installed to $scripts_dir"
-}
-
-# Install locally
-install_local() {
-    local install_dir="$HOME/.local/bin"
-    
-    log_info "Installing to $install_dir..."
-    
-    # Create directory if it doesn't exist
-    mkdir -p "$install_dir"
-    
-    # Copy main script
-    cp "$PROJECT_ROOT/cudo" "$install_dir/cudo"
-    chmod +x "$install_dir/cudo"
-    
-    # Create scripts directory
-    local scripts_dir="$HOME/.local/share/cudo"
-    mkdir -p "$scripts_dir"
-    cp "$PROJECT_ROOT/scripts/cuda-env-list-simple.py" "$scripts_dir/"
-    
-    # Update script path in main script
-    sed -i "s|SCRIPT_DIR=.*|SCRIPT_DIR=\"$scripts_dir\"|" "$install_dir/cudo"
-    
-    log_success "Installed cudo to $install_dir"
-    log_success "Support files installed to $scripts_dir"
-    
-    # Check if PATH includes ~/.local/bin
-    if [[ ":$PATH:" != *":$install_dir:"* ]]; then
-        log_warning "Please add $install_dir to your PATH"
-        echo "Add this line to your ~/.bashrc or ~/.zshrc:"
-        echo "export PATH=\"\$HOME/.local/bin:\$PATH\""
-    fi
+    log_success "Global configuration directory created: $global_config_dir"
 }
 
 # Main installation
 main() {
-    local install_type=${1:-local}
-    
     log_info "Cudo - Docker-based CUDA Development Environment Manager Installation"
     echo "========================================"
     
@@ -135,21 +107,7 @@ main() {
         exit 1
     fi
     
-    case $install_type in
-        "system")
-            install_system_wide
-            ;;
-        "local")
-            install_local
-            ;;
-        *)
-            log_error "Invalid installation type: $install_type"
-            echo "Usage: $0 [system|local]"
-            echo "  system: Install system-wide (requires sudo)"
-            echo "  local:  Install to user directory (default)"
-            exit 1
-            ;;
-    esac
+    install_system_wide
     
     echo
     log_success "Installation completed successfully!"

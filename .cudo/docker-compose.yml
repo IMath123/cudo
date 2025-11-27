@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  cuda-project-a5a67701:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: cuda-project-docker-env-a5a67701
+    network_mode: host
+    container_name: cuda-project-a5a67701-container
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+    volumes:
+      - ..:/workspace
+      - /tmp/.X11-unix:/tmp/.X11-unix
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

@@ -22,10 +22,6 @@ CONFIG_FILE="$CONFIG_DIR/config"
 DOCKERFILE="$CONFIG_DIR/Dockerfile"
 DOCKER_COMPOSE_FILE="$CONFIG_DIR/docker-compose.yml"
 
-# Global configuration directory (stores all project information)
-GLOBAL_CONFIG_DIR="$HOME/.cudo-global"
-mkdir -p $GLOBAL_CONFIG_DIR
-
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -38,6 +34,20 @@ log_success() { echo -e "${GREEN} $1${NC}"; }
 log_warning() { echo -e "${YELLOW}$1${NC}"; }
 log_error() { echo -e "${RED}$1${NC}"; }
 
+
+# Global configuration directory (stores all project information)
+# Use system-wide directory for multi-user support
+GLOBAL_CONFIG_DIR="/var/lib/cudo-global"
+# Try to create system directory first
+mkdir -p "$GLOBAL_CONFIG_DIR" 2>/dev/null || true
+# Ensure the global directory is writable, otherwise disable the tool
+if [ ! -w "$GLOBAL_CONFIG_DIR" ]; then
+    log_error "Global configuration directory $GLOBAL_CONFIG_DIR is not writable"
+    log_error "Please ensure the directory exists and has proper permissions:"
+    log_error "  sudo mkdir -p $GLOBAL_CONFIG_DIR"
+    log_error "  sudo chmod 777 $GLOBAL_CONFIG_DIR"
+    exit 1
+fi
 
 save_config() {
     # 不在这里生成哈希，哈希应该在 build 时或检测到拷贝时生成

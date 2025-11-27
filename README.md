@@ -29,34 +29,18 @@ A powerful command-line tool for managing CUDA development environments using Do
 
 For detailed installation instructions, please see the [INSTALL.md](INSTALL.md) file.
 
-### Quick Start (Recommended)
+### Quick Start
 ```bash
 # Clone the repository
 git clone https://github.com/IMath123/cudo.git
 cd cudo
 
-# Install locally (recommended for single user)
-./install.sh local
+# Run the installation script (requires sudo)
+./install.sh
 
 # Test the installation
 cudo --help
 ```
-
-### System-wide Installation
-```bash
-# Clone the repository
-git clone https://github.com/IMath123/cudo.git
-cd cudo
-
-# Install system-wide (requires sudo)
-./install.sh system
-
-# Test the installation
-cudo --help
-```
-
-### Manual Installation
-If you prefer manual installation, see [INSTALL.md](INSTALL.md) for step-by-step instructions.
 
 ## 🎯 Quick Start
 
@@ -177,7 +161,7 @@ Statistics:
 ├── docker-compose.yml       # Docker Compose configuration
 └── config                   # Project settings
 
-~/.cudo-global/              # Global configuration
+/var/lib/cudo-global/        # Global configuration (multi-user support)
 └── *.conf                  # Project metadata files
 ```
 
@@ -187,7 +171,7 @@ Statistics:
 2. **Container Orchestration**: Uses Docker Compose for lifecycle management
 3. **Volume Mounting**: Maps project directories into containers
 4. **GPU Access**: Configures NVIDIA runtime for GPU acceleration
-5. **Global Tracking**: Stores project metadata in `~/.cudo-global/`
+5. **Global Tracking**: Stores project metadata in `/var/lib/cudo-global/`
 6. **Resource Monitoring**: Integrates with Docker stats and NVIDIA tools
 
 ## 🐛 Troubleshooting
