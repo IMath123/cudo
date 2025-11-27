@@ -96,8 +96,8 @@ def get_running_containers_count():
             capture_output=True, text=True, check=True
         )
         containers = [name for name in result.stdout.strip().split('\n') if name]
-        # Only count containers that start with 'cuda-project'
-        cuda_containers = [name for name in containers if name.startswith('cuda-project')]
+        # Only count containers that start with 'cuda-project-' and end with '-container'
+        cuda_containers = [name for name in containers if name.startswith('cuda-project-') and name.endswith('-container')]
         return len(cuda_containers)
     except subprocess.CalledProcessError:
         return 0
@@ -189,7 +189,9 @@ def main():
         
         project_name = config.get('PROJECT_NAME', 'Unknown')
         image_name = config.get('IMAGE_NAME', '')
-        container_name = f"{image_name}-container"
+        unique_hash = config.get('UNIQUE_HASH', '')
+        # 容器名称现在基于唯一哈希
+        container_name = f"cuda-project-{unique_hash}-container"
         project_path = config.get('PROJECT_PATH', 'N/A')
         config_status = config.get('STATUS', 'active')
         

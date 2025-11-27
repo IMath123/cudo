@@ -160,7 +160,7 @@ main() {
     echo "  cudo list"
     echo
     echo "For more information, see:"
-    echo "  https://github.com/yourusername/cudo"
+    echo "  https://github.com/IMath123/cudo"
 }
 
 # Run main function
