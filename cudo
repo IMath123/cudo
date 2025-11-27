@@ -1,19 +1,18 @@
 #!/bin/bash
 
-# CUDA 环境管理脚本
-# 用法: ./cuda-env.sh [命令] [选项]
+# Cudo - CUDA Development Environment Manager
+# Usage: cudo [command] [options]
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 PROJECT_ROOT="$(pwd)"
 
-# 默认配置
+# Default Config
 DEFAULT_CUDA_VERSION="12.4.0"
 DEFAULT_UBUNTU_VERSION="20.04"
 DEFAULT_WITH_TOOLKIT="false"
 DEFAULT_PYTHON_VERSION="3.10"
 DEFAULT_IMAGE_NAME="cuda-project-$(basename "$PROJECT_ROOT" | tr '[:upper:]' '[:lower:]')"
 
-# 配置文件
 CONFIG_DIR="$PROJECT_ROOT/.cuda-docker-config"
 mkdir -p $CONFIG_DIR
 
@@ -21,20 +20,23 @@ CONFIG_FILE="$CONFIG_DIR/config"
 DOCKERFILE="$CONFIG_DIR/Dockerfile"
 DOCKER_COMPOSE_FILE="$CONFIG_DIR/docker-compose.yml"
 
-# 颜色定义
+# Global configuration directory (stores all project information)
+GLOBAL_CONFIG_DIR="$HOME/.cudo-global"
+mkdir -p $GLOBAL_CONFIG_DIR
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-# 日志函数
+# Log Function
 log_info() { echo -e "${BLUE}ℹ️  $1${NC}"; }
-log_success() { echo -e "${GREEN}✅ $1${NC}"; }
+log_success() { echo -e "${GREEN}✅  $1${NC}"; }
 log_warning() { echo -e "${YELLOW}⚠️  $1${NC}"; }
-log_error() { echo -e "${RED}❌ $1${NC}"; }
+log_error() { echo -e "${RED}❌  $1${NC}"; }
 
-# 保存配置
+
 save_config() {
     cat > "$CONFIG_FILE" << EOF
 CUDA_VERSION=$CUDA_VERSION
@@ -44,7 +46,62 @@ PYTHON_VERSION=$PYTHON_VERSION
 IMAGE_NAME=$IMAGE_NAME
 CUDA_VARIANT=$CUDA_VARIANT
 EOF
-    log_success "配置已保存"
+    log_success "Configuration saved"
+}
+
+save_to_global() {
+    local project_name=$(basename "$PROJECT_ROOT")
+    local project_path_hash=$(echo -n "$PROJECT_ROOT" | md5sum | cut -d' ' -f1 | head -c 8)
+    local unique_id="${project_name}-${project_path_hash}"
+    local global_config_file="$GLOBAL_CONFIG_DIR/${unique_id}.conf"
+    
+    # 检查是否已存在相同路径的配置
+    local existing_config=$(find "$GLOBAL_CONFIG_DIR" -name "*.conf" -exec grep -l "PROJECT_PATH=$PROJECT_ROOT$" {} \;)
+    
+    if [ -n "$existing_config" ]; then
+        rm -f "$existing_config"
+    fi
+    
+    cat > "$global_config_file" << EOF
+PROJECT_NAME=$project_name
+PROJECT_PATH=$PROJECT_ROOT
+CUDA_VERSION=$CUDA_VERSION
+UBUNTU_VERSION=$UBUNTU_VERSION
+WITH_TOOLKIT=$WITH_TOOLKIT
+PYTHON_VERSION=$PYTHON_VERSION
+IMAGE_NAME=$IMAGE_NAME
+CUDA_VARIANT=$CUDA_VARIANT
+CREATED_TIME="$(date '+%Y-%m-%d %H:%M:%S')"
+UNIQUE_ID=$unique_id
+EOF
+    log_success "Configuration saved to global storage: $unique_id"
+}
+
+remove_from_global() {
+    local project_name=$(basename "$PROJECT_ROOT")
+    local project_path_hash=$(echo -n "$PROJECT_ROOT" | md5sum | cut -d' ' -f1 | head -c 8)
+    local unique_id="${project_name}-${project_path_hash}"
+    local global_config_file="$GLOBAL_CONFIG_DIR/${unique_id}.conf"
+    
+    if [ -f "$global_config_file" ]; then
+        rm -f "$global_config_file"
+        log_success "Removed from global storage: $unique_id"
+    fi
+}
+
+# 清理旧的全局配置文件（基于项目名称的）
+cleanup_old_global_configs() {
+    local project_name=$(basename "$PROJECT_ROOT")
+    local project_path_hash=$(echo -n "$PROJECT_ROOT" | md5sum | cut -d' ' -f1 | head -c 8)
+    local current_unique_id="${project_name}-${project_path_hash}"
+    
+    # 查找所有相同项目名称的旧配置文件
+    for old_config in "$GLOBAL_CONFIG_DIR/${project_name}.conf"*; do
+        if [ -f "$old_config" ] && [[ "$old_config" != *"$current_unique_id.conf" ]]; then
+            rm -f "$old_config"
+            log_info "Cleaned up old global config: $(basename "$old_config")"
+        fi
+    done
 }
 
 # 加载配置
@@ -74,8 +131,8 @@ check_dependencies() {
     fi
     
     if [ ${#missing[@]} -ne 0 ]; then
-        log_error "缺少依赖: ${missing[*]}"
-        echo "请安装以下软件:"
+        log_error "Missing dependencies: ${missing[*]}"
+        echo "Please install the following software:"
         for dep in "${missing[@]}"; do
             case $dep in
                 "docker")
@@ -168,7 +225,7 @@ RUN echo ". /opt/conda/etc/profile.d/conda.sh" >> ~/.bashrc && \\
 
 CMD ["/bin/bash"]
 EOF
-    log_success "Dockerfile 已生成"
+    log_success "Dockerfile generated"
 }
 
 # 生成 docker-compose.yml
@@ -206,22 +263,64 @@ services:
               count: all
               capabilities: [gpu]
 EOF
-    log_success "docker-compose.yml 已生成"
-    log_info "服务名称: ${service_name}"
+    log_success "docker-compose.yml generated"
+    log_info "Service name: ${service_name}"
 }
 
 # 构建镜像
 build_image() {
-    log_info "开始构建镜像..."
+    log_info "Starting image build..."
     cd "$CONFIG_DIR"
     
     if docker_compose_cmd build; then
-        log_success "镜像构建成功!"
-        log_info "镜像名称: $IMAGE_NAME"
-        log_info "工作目录: $PROJECT_ROOT"
+        log_success "Image build successful!"
+        log_info "Image name: $IMAGE_NAME"
+        log_info "Working directory: $PROJECT_ROOT"
     else
-        log_error "镜像构建失败!"
+        log_error "Image build failed!"
         exit 1
+    fi
+}
+
+# 获取容器资源使用信息
+get_container_stats() {
+    local container_name="$1-container"
+    local stats_output
+    
+    if docker ps --format "table {{.Names}}" | grep -q "$container_name"; then
+        # 获取 CPU 使用率
+        local cpu_usage=$(docker stats --no-stream --format "{{.CPUPerc}}" "$container_name" 2>/dev/null | head -1 || echo "N/A")
+        
+        # 获取内存使用
+        local mem_usage=$(docker stats --no-stream --format "{{.MemUsage}}" "$container_name" 2>/dev/null | head -1 || echo "N/A")
+        
+        # 获取内存限制
+        local mem_limit=$(docker stats --no-stream --format "{{.MemPerc}}" "$container_name" 2>/dev/null | head -1 || echo "N/A")
+        
+        echo "$cpu_usage|$mem_usage|$mem_limit"
+    else
+        echo "N/A|N/A|N/A"
+    fi
+}
+
+# 获取容器详细信息
+get_container_info() {
+    local container_name="$1-container"
+    local info_output
+    
+    if docker ps -a --format "table {{.Names}}" | grep -q "$container_name"; then
+        # 获取容器状态
+        local status=$(docker ps -a --format "table {{.Names}}\t{{.Status}}" | grep "$container_name" | awk '{print $2}')
+        
+        # 获取创建时间
+        local created=$(docker inspect --format='{{.Created}}' "$container_name" 2>/dev/null | cut -d'T' -f1 || echo "N/A")
+        
+        # 获取端口映射
+        local ports=$(docker inspect --format='{{range $p, $conf := .NetworkSettings.Ports}}{{(index $conf 0).HostPort}}->{{$p}} {{end}}' "$container_name" 2>/dev/null || echo "N/A")
+        
+        echo "$status|$created|$ports"
+    else
+        echo "nonexistent|N/A|N/A"
     fi
 }
 
@@ -245,7 +344,7 @@ docker_compose_cmd() {
     elif command -v docker-compose > /dev/null; then
         docker-compose "$@"
     else
-        log_error "未找到 docker compose 或 docker-compose 命令"
+        log_error "docker compose or docker-compose command not found"
         exit 1
     fi
 }
@@ -297,7 +396,7 @@ build_command() {
                 shift 2
                 ;;
             *)
-                log_error "未知选项: $1"
+                log_error "Unknown option: $1"
                 usage
                 exit 1
                 ;;
@@ -319,13 +418,13 @@ build_command() {
     IMAGE_NAME=$image_name
     CUDA_VARIANT=$cuda_variant
     
-    echo "构建配置:"
-    echo "  CUDA 版本: $CUDA_VERSION"
-    echo "  Ubuntu 版本: $UBUNTU_VERSION"
-    echo "  CUDA 变体: $CUDA_VARIANT"
-    echo "  Python 版本: $PYTHON_VERSION"
-    echo "  镜像名称: $IMAGE_NAME"
-    echo "  项目路径: $PROJECT_ROOT"
+    echo "Build configuration:"
+    echo "  CUDA version: $CUDA_VERSION"
+    echo "  Ubuntu version: $UBUNTU_VERSION"
+    echo "  CUDA variant: $CUDA_VARIANT"
+    echo "  Python version: $PYTHON_VERSION"
+    echo "  Image name: $IMAGE_NAME"
+    echo "  Project path: $PROJECT_ROOT"
     
     # 检查依赖
     check_dependencies
@@ -337,19 +436,28 @@ build_command() {
     
     # 构建镜像
     build_image
+    
+    # 清理旧的全局配置文件
+    cleanup_old_global_configs
+    
+    # 保存到全局配置
+    save_to_global
 }
 
 # 运行命令
 run_command() {
     if ! load_config; then
-        log_error "未找到配置文件，请先运行构建命令: $0 build"
+        log_error "Configuration file not found, please run build command first: cudo build"
         exit 1
     fi
     
     if ! check_image_exists "$IMAGE_NAME"; then
-        log_error "镜像 '$IMAGE_NAME' 不存在，请先运行构建命令: $0 build"
+        log_error "Image '$IMAGE_NAME' does not exist, please run build command first: cudo build"
         exit 1
     fi
+    
+    # 保存到全局配置（确保现有环境也被记录）
+    save_to_global
     
     local command=${1:-exec}
     local service_name=$(get_service_name "$IMAGE_NAME")
@@ -359,28 +467,43 @@ run_command() {
             local status=$(check_container_status "$IMAGE_NAME")
             case $status in
                 "running")
-                    log_success "容器正在运行"
+                    log_success "Container is running"
                     ;;
                 "stopped")
-                    log_warning "容器已停止"
+                    log_warning "Container is stopped"
                     ;;
                 "nonexistent")
-                    log_info "容器不存在"
+                    log_info "Container does not exist"
                     ;;
             esac
             ;;
         "start")
-            log_info "启动容器..."
+            log_info "Starting container..."
             cd "$CONFIG_DIR"
             docker_compose_cmd up -d
             ;;
         "stop")
-            log_info "停止容器..."
+            log_info "Stopping container..."
             cd "$CONFIG_DIR"
             docker_compose_cmd down
             ;;
         "restart")
-            log_info "重启容器..."
+            log_info "Restarting container..."
+            cd "$CONFIG_DIR"
+            docker_compose_cmd restart
+            ;;
+        "reset")
+            log_warning "This will reset the container (delete and recreate)"
+            log_warning "Project: $PROJECT_ROOT"
+            log_warning "Image: $IMAGE_NAME"
+            echo
+            read -p "Confirm reset? Enter 'y' to continue: " confirm
+            if [ "$confirm" != "y" ]; then
+                log_info "Operation cancelled"
+                exit 0
+            fi
+            
+            log_info "Resetting container (delete and recreate)..."
             cd "$CONFIG_DIR"
             docker_compose_cmd down
             docker_compose_cmd up -d
@@ -393,18 +516,18 @@ run_command() {
             local status=$(check_container_status "$IMAGE_NAME")
             case $status in
                 "running")
-                    log_info "进入容器..."
+                    log_info "Entering container..."
                     docker exec -it "${IMAGE_NAME}-container" bash
                     ;;
                 "stopped")
-                    log_info "启动容器并进入..."
+                    log_info "Starting container and entering..."
                     cd "$CONFIG_DIR"
                     docker_compose_cmd up -d
                     sleep 2
                     docker exec -it "${IMAGE_NAME}-container" bash
                     ;;
                 "nonexistent")
-                    log_info "创建并启动容器..."
+                    log_info "Creating and starting container..."
                     cd "$CONFIG_DIR"
                     docker_compose_cmd up -d
                     sleep 2
@@ -413,15 +536,26 @@ run_command() {
             esac
             ;;
         "remove")
-            log_info "清理容器和镜像..."
+            log_warning "This will delete the container, image, and all configuration files"
+            log_warning "Project: $PROJECT_ROOT"
+            log_warning "Image: $IMAGE_NAME"
+            echo
+            read -p "Confirm deletion? Enter 'y' to continue: " confirm
+            if [ "$confirm" != "y" ]; then
+                log_info "Operation cancelled"
+                exit 0
+            fi
+            
+            log_info "Cleaning up container and image..."
             cd "$CONFIG_DIR"
             docker_compose_cmd down 2>/dev/null || true
             docker rmi "$IMAGE_NAME" 2>/dev/null || true
             rm -rf "$CONFIG_DIR" 2>/dev/null || true
-            log_success "已清理所有容器、镜像和配置文件"
+            remove_from_global
+            log_success "All containers, images, and configuration files cleaned up"
             ;;
         *)
-            log_error "未知运行命令: $command"
+            log_error "Unknown run command: $command"
             usage
             exit 1
             ;;
@@ -431,59 +565,91 @@ run_command() {
 # 配置命令
 config_command() {
     if load_config; then
-        echo "当前配置:"
-        echo "  CUDA 版本: $CUDA_VERSION"
-        echo "  Ubuntu 版本: $UBUNTU_VERSION"
-        echo "  CUDA 变体: $CUDA_VARIANT"
-        echo "  Python 版本: $PYTHON_VERSION"
-        echo "  镜像名称: $IMAGE_NAME"
+        echo "Current configuration:"
+        echo "  CUDA version: $CUDA_VERSION"
+        echo "  Ubuntu version: $UBUNTU_VERSION"
+        echo "  CUDA variant: $CUDA_VARIANT"
+        echo "  Python version: $PYTHON_VERSION"
+        echo "  Image name: $IMAGE_NAME"
     else
-        log_info "暂无配置，使用默认配置:"
-        echo "  CUDA 版本: $DEFAULT_CUDA_VERSION"
-        echo "  Ubuntu 版本: $DEFAULT_UBUNTU_VERSION"
-        echo "  CUDA 变体: runtime"
-        echo "  Python 版本: $DEFAULT_PYTHON_VERSION"
-        echo "  镜像名称: $DEFAULT_IMAGE_NAME"
+        log_info "No configuration found, using defaults:"
+        echo "  CUDA version: $DEFAULT_CUDA_VERSION"
+        echo "  Ubuntu version: $DEFAULT_UBUNTU_VERSION"
+        echo "  CUDA variant: runtime"
+        echo "  Python version: $DEFAULT_PYTHON_VERSION"
+        echo "  Image name: $DEFAULT_IMAGE_NAME"
     fi
+}
+
+# 列出所有 CUDA 环境
+list_command() {
+    local show_details=${1:-false}
+    local show_gpu=${2:-false}
+    
+    # 使用简化版本的 Python 脚本来显示表格
+    local python_script="$SCRIPT_DIR/scripts/cuda-env-list-simple.py"
+    
+    if [ ! -f "$python_script" ]; then
+        log_error "Python list script not found: $python_script"
+        return 1
+    fi
+    
+    local args=""
+    if [ "$show_details" = "true" ]; then
+        args="$args --details"
+    fi
+    if [ "$show_gpu" = "true" ]; then
+        args="$args --gpu"
+    fi
+    
+    python3 "$python_script" $args
 }
 
 # 显示用法
 usage() {
     cat << EOF
-CUDA 环境管理脚本
+Cudo - CUDA Development Environment Manager
 
-用法: $0 <命令> [选项]
+Usage: cudo <command> [options]
 
-命令:
-  build [选项]    构建 CUDA 环境镜像
-  run [子命令]    运行和管理容器
-  config          显示当前配置
-  help            显示此帮助信息
+Commands:
+  build [options]    Build CUDA environment image
+  run [subcommand]   Run and manage containers
+  config             Show current configuration
+  list [options]     List all CUDA environments
+  help               Show this help message
 
-构建选项:
-  -c, --cuda-version     CUDA 版本 (默认: $DEFAULT_CUDA_VERSION)
-  -u, --ubuntu-version   Ubuntu 版本 (默认: $DEFAULT_UBUNTU_VERSION)
-  -t, --with-toolkit     是否包含 CUDA Toolkit (true/false) (默认: $DEFAULT_WITH_TOOLKIT)
-  -p, --python-version   Python 版本 (默认: $DEFAULT_PYTHON_VERSION)
-  -i, --image-name       镜像名称 (默认: 基于项目名称)
+Build options:
+  -c, --cuda-version     CUDA version (default: $DEFAULT_CUDA_VERSION)
+  -u, --ubuntu-version   Ubuntu version (default: $DEFAULT_UBUNTU_VERSION)
+  -t, --with-toolkit     Include CUDA Toolkit (true/false) (default: $DEFAULT_WITH_TOOLKIT)
+  -p, --python-version   Python version (default: $DEFAULT_PYTHON_VERSION)
+  -i, --image-name       Image name (default: based on project name)
 
-运行子命令:
-  (无子命令)      启动并进入容器
-  status         查看容器状态
-  start          启动容器
-  stop           停止容器
-  restart        重启容器
-  logs           查看容器日志
-  exec           进入容器
-  remove         删除容器、镜像和配置文件
+Run subcommands:
+  (no subcommand)    Start and enter container
+  status             Check container status
+  start              Start container
+  stop               Stop container
+  restart            Restart container (preserve state)
+  reset              Reset container (delete and recreate)
+  logs               View container logs
+  exec               Enter container
+  remove             Delete container, image and configuration files
 
-示例:
-  $0 build -c 11.8.0 -p 3.8
-  $0 run
-  $0 run status
-  $0 run logs
-  $0 config
-  $0 run remove
+List options:
+  -d, --details      Show detailed resource information (CPU, memory usage, etc.)
+  -g, --gpu          Show GPU memory usage information
+
+Examples:
+  cudo build -c 11.8.0 -p 3.8
+  cudo run
+  cudo run status
+  cudo run logs
+  cudo config
+  cudo list
+  cudo list --details
+  cudo run remove
 EOF
 }
 
@@ -508,6 +674,9 @@ main() {
         "restart")
             run_command restart
             ;;
+        "reset")
+            run_command reset
+            ;;
         "status")
             run_command status
             ;;
@@ -517,11 +686,31 @@ main() {
         "config")
             config_command
             ;;
+        "list")
+            local show_details=false
+            local show_gpu=false
+            while [[ $# -gt 0 ]]; do
+                case $1 in
+                    -d|--details)
+                        show_details=true
+                        shift
+                        ;;
+                    -g|--gpu)
+                        show_gpu=true
+                        shift
+                        ;;
+                    *)
+                        shift
+                        ;;
+                esac
+            done
+            list_command "$show_details" "$show_gpu"
+            ;;
         "help"|"-h"|"--help"|"")
             usage
             ;;
         *)
-            log_error "未知命令: $command"
+            log_error "Unknown command: $command"
             usage
             exit 1
             ;;

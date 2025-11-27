@@ -1,0 +1,80 @@
+name: Test Cudo
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+        
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        
+    - name: Test script syntax
+      run: |
+        # Test main script syntax
+        bash -n cudo
+        
+        # Test install script syntax
+        bash -n scripts/install.sh
+        
+        # Test Python script syntax
+        python3 -m py_compile scripts/cuda-env-list-simple.py
+        
+    - name: Test help command
+      run: |
+        ./cudo --help
+        
+    - name: Test list command (no environments)
+      run: |
+        ./cudo list
+        
+    - name: Test config command (no config)
+      run: |
+        ./cudo config
+        
+    - name: Test install script
+      run: |
+        # Test local installation
+        ./scripts/install.sh local
+        
+        # Verify installation
+        $HOME/.local/bin/cudo --help
+        
+  shellcheck:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Run ShellCheck
+      uses: ludeeus/action-shellcheck@master
+      with:
+        scandir: '.'
+        severity: 'error'
+        
+  markdown-lint:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Lint Markdown
+      uses: docker://avtodev/markdown-lint:v1
+      with:
+        args: "**/*.md"
