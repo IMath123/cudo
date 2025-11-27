@@ -68,17 +68,17 @@ cd my-cuda-project
 
 ### 2. Build your CUDA environment
 ```bash
-./cudo build -c 11.8.0 -p 3.10
+cudo build -c 11.8.0 -p 3.10
 ```
 
 ### 3. Run and enter the container
 ```bash
-./cudo run
+cudo run
 ```
 
 ### 4. View all your CUDA environments
 ```bash
-./cudo list
+cudo list
 ```
 
 ## 📖 Usage
@@ -167,7 +167,6 @@ test-env    12.4.0  20.04   3.10    Stopped    /home/user/projects/test-env
 Statistics:
   Total environments: 2
   Running: 1
-  System memory: 503Gi
 ```
 
 ## 🏗️ Project Structure
@@ -254,8 +253,8 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 📞 Support
 
-- **Issues**: [GitHub Issues](https://github.com/yourusername/cudo/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/yourusername/cudo/discussions)
+- **Issues**: [GitHub Issues](https://github.com/IMath123/cudo/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/IMath123/cudo/discussions)
 - **Email**: imatphy@gmail.com
 
 ---
