@@ -16,6 +16,41 @@ A powerful command-line tool for managing CUDA development environments using Do
 - **Docker Integration**: Seamless integration with Docker and Docker Compose
 - **Customizable**: Flexible configuration for CUDA versions, Python versions, and more
 
+## 💡 Why Cudo?
+
+Stop wrestling with complex Docker commands. Cudo simplifies your workflow significantly.
+
+| Feature | Manual Docker Command | Cudo |
+|---------|----------------------|------|
+| **Build Environment** | `docker build -t my-env .` | `cudo build` |
+| **Run Container** | `docker run --gpus all -it -v $(pwd):/workspace my-env` | `cudo run` |
+| **GPU Setup** | Requires manual flag configuration | **Automatic** |
+| **Volume Mounting** | Manual `-v` flag for every run | **Automatic** |
+| **Project Tracking** | Manual bookkeeping | **Built-in Registry** |
+
+### See the difference:
+
+**Without Cudo:**
+```bash
+# Build (hope you have the right Dockerfile)
+docker build -t my-cuda-project .
+
+# Run (don't forget the flags!)
+docker run --gpus all -it \
+  --shm-size=8g \
+  -v $(pwd):/workspace \
+  -w /workspace \
+  --name my-cuda-container \
+  my-cuda-project
+```
+
+**With Cudo:**
+```bash
+# Build & Run
+cudo build
+cudo run
+```
+
 
 ## 📋 Requirements
 
@@ -29,14 +64,10 @@ A powerful command-line tool for managing CUDA development environments using Do
 
 For detailed installation instructions, please see the [INSTALL.md](INSTALL.md) file.
 
-### Quick Start
+### One-Line Installation
 ```bash
-# Clone the repository
-git clone https://github.com/IMath123/cudo.git
-cd cudo
-
-# Run the installation script (requires sudo)
-./install.sh
+# Install with a single command
+curl -fsSL https://raw.githubusercontent.com/IMath123/cudo/master/get-cudo.sh | bash
 
 # Test the installation
 cudo --help

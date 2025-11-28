@@ -23,24 +23,112 @@ if [ "$EUID" -eq 0 ]; then
     exit 1
 fi
 
+# Check OS
+if [[ "$OSTYPE" == "darwin"* ]]; then
+    log_error "Error: macOS is not supported."
+    log_error "Cudo is designed for Linux environments with NVIDIA GPUs and Docker."
+    exit 1
+fi
+
 # Get script directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$SCRIPT_DIR"
 
 log_info "Installing Cudo - CUDA Development Environment Manager..."
 
+# Install Docker
+install_docker() {
+    log_info "Docker is not installed. Installing Docker..."
+    echo "This will run: curl -fsSL https://get.docker.com | sh"
+    read -p "Do you want to continue? [y/N] " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        log_error "Installation aborted by user."
+        return 1
+    fi
+
+    if curl -fsSL https://get.docker.com | sh; then
+        log_success "Docker installed successfully."
+        # Add current user to docker group if sudo is available
+        if [ -n "$SUDO_USER" ]; then
+            usermod -aG docker "$SUDO_USER"
+            log_info "Added user $SUDO_USER to docker group."
+        fi
+        systemctl start docker
+        systemctl enable docker
+        return 0
+    else
+        log_error "Failed to install Docker."
+        return 1
+    fi
+}
+
+# Install NVIDIA Docker
+install_nvidia_docker() {
+    log_info "NVIDIA Docker is not installed. Installing NVIDIA Docker..."
+    read -p "Do you want to continue? [y/N] " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        log_error "Installation aborted by user."
+        return 1
+    fi
+
+    # Detect distribution
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        distribution=$ID$VERSION_ID
+    else
+        log_error "Could not detect OS distribution."
+        return 1
+    fi
+
+    log_info "Detected distribution: $distribution"
+    
+    curl -s -L https://nvidia.github.io/nvidia-docker/gpgkey | apt-key add -
+    curl -s -L https://nvidia.github.io/nvidia-docker/$distribution/nvidia-docker.list | tee /etc/apt/sources.list.d/nvidia-docker.list
+    
+    apt-get update
+    if apt-get install -y nvidia-docker2; then
+        systemctl restart docker
+        log_success "NVIDIA Docker installed successfully."
+        return 0
+    else
+        log_error "Failed to install NVIDIA Docker."
+        return 1
+    fi
+}
+
 # Check dependencies
 check_dependencies() {
     local missing=()
     
     if ! command -v docker &> /dev/null; then
-        missing+=("docker")
+        if ! install_docker; then
+            log_error "Docker is required but could not be installed."
+            return 1
+        fi
     fi
     
-    if ! command -v docker-compose &> /dev/null; then
-        missing+=("docker-compose")
+    # Check for docker-compose (v1 or v2)
+    if ! command -v docker-compose &> /dev/null && ! (command -v docker &> /dev/null && docker compose version &> /dev/null); then
+        # Docker Compose V2 is usually included in modern Docker installation
+        # If still missing, we could try to install it, but let's stick to core Docker for now
+        # or assume 'docker compose' works if docker is installed via get-docker.com
+        if ! command -v docker &> /dev/null || ! docker compose version &> /dev/null; then
+             log_warning "Docker Compose not found. It might be available as 'docker compose'."
+        fi
     fi
     
+    # Check for NVIDIA Docker (nvidia-smi check inside container or check for runtime)
+    # Simple check: look for nvidia-container-runtime or try to run a test container?
+    # Better: check if /etc/docker/daemon.json contains nvidia runtime or check packages
+    if ! dpkg -l | grep -q nvidia-docker2 && ! dpkg -l | grep -q nvidia-container-toolkit; then
+         if ! install_nvidia_docker; then
+            log_error "NVIDIA Docker is required for GPU support but could not be installed."
+            return 1
+         fi
+    fi
+
     if ! command -v python3 &> /dev/null; then
         missing+=("python3")
     fi
@@ -50,12 +138,6 @@ check_dependencies() {
         echo "Please install the following software:"
         for dep in "${missing[@]}"; do
             case $dep in
-                "docker")
-                    echo "  Docker: https://docs.docker.com/get-docker/"
-                    ;;
-                "docker-compose")
-                    echo "  Docker Compose: https://docs.docker.com/compose/install/"
-                    ;;
                 "python3")
                     echo "  Python 3:"
                     echo "    Ubuntu/Debian: sudo apt-get install python3"
