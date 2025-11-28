@@ -392,8 +392,6 @@ generate_docker_compose() {
     local container_name="${service_name}-container"
     
     cat > "$DOCKER_COMPOSE_FILE" << EOF
-version: '3.8'
-
 services:
   ${service_name}:
     build:
