@@ -169,7 +169,7 @@ def get_system_memory():
         return 'N/A'
 
 def main():
-    global_config_dir = Path.home() / '.cudo-global'
+    global_config_dir = Path('/var/lib/cudo-global')
     
     if not global_config_dir.exists() or not any(global_config_dir.glob('*.conf')):
         print("No CUDA environment configurations found")
