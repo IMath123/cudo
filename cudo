@@ -588,9 +588,16 @@ check_docker_image_exists() {
     
     log_info "Checking if Docker image exists: $image_name"
     
-    # 尝试拉取镜像信息（不实际下载）
-    if docker manifest inspect "$image_name" > /dev/null 2>&1; then
-        log_success "Docker image found: $image_name"
+    # 首先检查本地是否有该镜像
+    if docker image inspect "$image_name" > /dev/null 2>&1; then
+        log_success "Docker image found locally: $image_name"
+        return 0
+    fi
+    
+    # 本地没有，直接尝试拉取镜像
+    log_info "Image not found locally, pulling from remote registry..."
+    if docker pull "$image_name"; then
+        log_success "Docker image pulled successfully: $image_name"
         return 0
     else
         log_error "Docker image not found: $image_name"
