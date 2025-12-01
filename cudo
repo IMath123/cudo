@@ -406,6 +406,7 @@ services:
     volumes:
       - ..:/workspace
       - /tmp/.X11-unix:/tmp/.X11-unix
+      - /dev/shm:/dev/shm
     working_dir: /workspace
     stdin_open: true
     tty: true
@@ -791,7 +792,7 @@ run_command() {
         log_error "This usually happens when:"
         log_error "  1. The project was moved and the old image was deleted"
         log_error "  2. The image was manually removed"
-        log_error "  3. Docker was reset/cleaned"
+        log_error "  3. Docker was restore/cleaned"
         log_error ""
         log_error "To fix this, rebuild the environment:"
         log_error "  cudo build"
@@ -896,8 +897,8 @@ restart_command() {
     docker_compose_cmd restart
 }
 
-# 重置命令
-reset_command() {
+# commit
+commit_command() {
     mkdir -p $CONFIG_DIR
 
     if ! load_config; then
@@ -907,11 +908,46 @@ reset_command() {
     
     save_to_global
     
-    log_warning "This will reset the container (delete and recreate)"
+    local container_name="cuda-project-${UNIQUE_HASH}-container"
+    
+    # 检查容器是否存在
+    if ! docker ps -a --format "table {{.Names}}" | grep -q "$container_name"; then
+        log_error "Container '$container_name' does not exist. Cannot commit."
+        log_error "Please run 'cudo run' to start the container first."
+        exit 1
+    fi
+    
+    # 执行提交
+    local commit_msg="Commit by cudo at $(date '+%Y-%m-%d %H:%M:%S')"
+    log_info "Committing container $container_name to image $IMAGE_NAME..."
+    if docker commit -m "$commit_msg" "$container_name" "$IMAGE_NAME"; then
+        log_success "Container committed successfully!"
+        log_info "New image: $IMAGE_NAME"
+        # 显示新镜像ID
+        local new_image_id=$(docker image inspect --format='{{.Id}}' "$IMAGE_NAME" 2>/dev/null || echo "unknown")
+        log_info "Image ID: ${new_image_id:0:12}"
+    else
+        log_error "Failed to commit container."
+        exit 1
+    fi
+}
+
+# 重置命令
+restore_command() {
+    mkdir -p $CONFIG_DIR
+
+    if ! load_config; then
+        log_error "Configuration file not found, please run build command first: cudo build"
+        exit 1
+    fi
+    
+    save_to_global
+    
+    log_warning "This will restore the container to the last commit state"
     log_warning "Project: $PROJECT_ROOT"
     log_warning "Image: $IMAGE_NAME"
     echo
-    read -p "Confirm reset? Enter 'y' to continue: " confirm
+    read -p "Confirm restore? Enter 'y' to continue: " confirm
     if [ "$confirm" != "y" ]; then
         log_info "Operation cancelled"
         exit 0
@@ -1027,8 +1063,9 @@ Commands:
   status             Check container status
   start              Start container
   stop               Stop container
+  commit             Save container state
   restart            Restart container (preserve state)
-  reset              Reset container (delete and recreate)
+  restore            Restore container (restore to the last state)
   logs               View container logs
   remove             Delete container, image and configuration files
   config             Show current configuration
@@ -1050,6 +1087,9 @@ List options:
 Examples:
   cudo build -c 11.8.0 -p 3.8
   cudo run
+  cudo commit
+  cudo restore
+  cudo restart
   cudo status
   cudo logs
   cudo config
@@ -1087,11 +1127,14 @@ main() {
         "stop")
             stop_command "$@"
             ;;
+        "commit")
+            commit_command "$@"
+            ;;
         "restart")
             restart_command "$@"
             ;;
-        "reset")
-            reset_command "$@"
+        "restore")
+            restore_command "$@"
             ;;
         "status")
             status_command "$@"
