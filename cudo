@@ -323,7 +323,6 @@ generate_dockerfile() {
 FROM nvidia/cuda:${cuda_version}-${cuda_variant}-ubuntu${ubuntu_version}
 
 ENV LANG=C.UTF-8 LC_ALL=C.UTF-8
-ENV PATH /opt/conda/bin:\$PATH
 
 # 安装基础工具
 RUN apt-get update && apt-get install -y --no-install-recommends \\
@@ -346,13 +345,28 @@ RUN apt-get update && apt-get install -y --no-install-recommends \\
     && apt-get clean \\
     && rm -rf /var/lib/apt/lists/*
 
-# 安装 Miniconda
-RUN wget --quiet https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O ~/miniconda.sh && \\
-    /bin/bash ~/miniconda.sh -b -p /opt/conda && \\
-    rm ~/miniconda.sh && \\
-    ln -s /opt/conda/etc/profile.d/conda.sh /etc/profile.d/conda.sh
+# 创建工作目录
+WORKDIR /workspace
 
-# 设置conda环境
+# 创建用户并设置权限（在安装 Miniconda 之前）
+RUN groupadd -g ${current_gid} ${current_user} && \\
+    useradd -m -u ${current_uid} -g ${current_gid} -s /bin/bash ${current_user} && \\
+    echo "${current_user} ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers.d/${current_user} && \\
+    chmod 0440 /etc/sudoers.d/${current_user} && \\
+    chown -R ${current_user}:${current_user} /workspace
+
+# 切换用户（以便以用户身份安装 Miniconda）
+USER ${current_user}
+
+# 安装 Miniconda 到用户 home 目录
+RUN wget --quiet https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O ~/miniconda.sh && \\
+    /bin/bash ~/miniconda.sh -b -p /home/${current_user}/miniconda3 && \\
+    rm ~/miniconda.sh
+
+# 设置 conda 环境变量
+ENV PATH /home/${current_user}/miniconda3/bin:\$PATH
+
+# 配置 conda 环境（以用户身份运行）
 RUN conda config --set always_yes yes --set changeps1 no && \\
     conda clean -ya && \\
     conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main && \\
@@ -360,22 +374,8 @@ RUN conda config --set always_yes yes --set changeps1 no && \\
     conda install python=${python_version} && \\
     conda config --set always_yes false --set changeps1 yes
 
-# 创建工作目录
-WORKDIR /workspace
-
-# 创建用户并设置权限（在安装完所有软件后切换用户）
-RUN groupadd -g ${current_gid} ${current_user} && \\
-    useradd -m -u ${current_uid} -g ${current_gid} -s /bin/bash ${current_user} && \\
-    echo "${current_user} ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers.d/${current_user} && \\
-    chmod 0440 /etc/sudoers.d/${current_user} && \\
-    chown -R ${current_user}:${current_user} /opt/conda && \\
-    chown -R ${current_user}:${current_user} /workspace
-
-# 切换用户
-USER ${current_user}
-
-# 为用户配置 conda
-RUN echo ". /opt/conda/etc/profile.d/conda.sh" >> ~/.bashrc && \\
+# 为用户配置 conda（添加到 bashrc）
+RUN echo ". /home/${current_user}/miniconda3/etc/profile.d/conda.sh" >> ~/.bashrc && \\
     echo "conda activate base" >> ~/.bashrc
 
 CMD ["/bin/bash"]
