@@ -359,7 +359,7 @@ RUN groupadd -g ${current_gid} ${current_user} && \\
 USER ${current_user}
 
 # 安装 Miniconda 到用户 home 目录
-RUN wget --quiet https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O ~/miniconda.sh && \\
+RUN wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O ~/miniconda.sh && \\
     /bin/bash ~/miniconda.sh -b -p /home/${current_user}/miniconda3 && \\
     rm ~/miniconda.sh
 
@@ -403,6 +403,7 @@ services:
     runtime: nvidia
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
     volumes:
       - ..:/workspace
       - /tmp/.X11-unix:/tmp/.X11-unix
