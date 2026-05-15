@@ -188,6 +188,7 @@ def main():
             continue
         
         project_name = config.get('PROJECT_NAME', 'Unknown')
+        env_name = config.get('ENV_NAME') or project_name
         image_name = config.get('IMAGE_NAME', '')
         unique_hash = config.get('UNIQUE_HASH', '')
         # 容器名称现在基于唯一哈希
@@ -215,6 +216,7 @@ def main():
         
         # Prepare environment info
         env_info = {
+            'env_name': env_name,
             'project_name': project_name,
             'cuda_version': config.get('CUDA_VERSION', 'N/A'),
             'ubuntu_version': config.get('UBUNTU_VERSION', 'N/A'),
@@ -242,7 +244,7 @@ def main():
             mode_name += " with GPU"
         print(f"CUDA Environment List ({mode_name})")
         
-        headers = ["PROJECT", "CUDA", "UBUNTU", "PYTHON", "STATUS", "CPU", "MEMORY"]
+        headers = ["NAME", "CUDA", "UBUNTU", "PYTHON", "STATUS", "CPU", "MEMORY"]
         if show_gpu:
             headers.append("GPU MEM")
         headers.append("CREATED")
@@ -251,7 +253,7 @@ def main():
         table_data = []
         for env in environments:
             row = [
-                env['project_name'],
+                env['env_name'],
                 env['cuda_version'],
                 env['ubuntu_version'],
                 env['python_version'],
@@ -274,13 +276,13 @@ def main():
     else:
         # Simple mode
         print("CUDA Environment List")
-        headers = ["PROJECT", "CUDA", "UBUNTU", "PYTHON", "STATUS", "PATH"]
+        headers = ["NAME", "CUDA", "UBUNTU", "PYTHON", "STATUS", "PATH"]
         
         # Prepare data for formatting
         table_data = []
         for env in environments:
             table_data.append([
-                env['project_name'],
+                env['env_name'],
                 env['cuda_version'],
                 env['ubuntu_version'],
                 env['python_version'],

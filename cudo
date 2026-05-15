@@ -34,6 +34,157 @@ log_success() { echo -e "${GREEN} $1${NC}"; }
 log_warning() { echo -e "${YELLOW}$1${NC}"; }
 log_error() { echo -e "${RED}$1${NC}"; }
 
+read_config_value() {
+    local config_file=$1
+    local key=$2
+    grep -m1 "^${key}=" "$config_file" 2>/dev/null | cut -d'=' -f2- | sed 's/^"//; s/"$//'
+}
+
+set_config_value() {
+    local config_file=$1
+    local key=$2
+    local value=$3
+
+    if grep -q "^${key}=" "$config_file" 2>/dev/null; then
+        sed -i "s|^${key}=.*|${key}=${value}|" "$config_file"
+    else
+        echo "${key}=${value}" >> "$config_file"
+    fi
+}
+
+normalize_env_name() {
+    local raw_name=$1
+    local env_name
+
+    env_name=$(printf '%s' "$raw_name" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/-/g; s/^[._-]*//; s/[._-]*$//')
+    if [ -z "$env_name" ]; then
+        env_name="cudo-env"
+    fi
+
+    echo "$env_name"
+}
+
+validate_env_name() {
+    local env_name=$1
+
+    if ! [[ "$env_name" =~ ^[a-z0-9._-]+$ ]]; then
+        log_error "Invalid environment name: '$env_name'"
+        log_error "Environment names can only contain lowercase letters, numbers, dots, hyphens, and underscores"
+        return 1
+    fi
+
+    if [[ "$env_name" =~ ^[._-] ]]; then
+        log_error "Invalid environment name: '$env_name'"
+        log_error "Environment names cannot start with a dot, hyphen, or underscore"
+        return 1
+    fi
+
+    if [[ "$env_name" =~ [._-]$ ]]; then
+        log_error "Invalid environment name: '$env_name'"
+        log_error "Environment names cannot end with a dot, hyphen, or underscore"
+        return 1
+    fi
+
+    if [[ "$env_name" =~ \.\. ]]; then
+        log_error "Invalid environment name: '$env_name'"
+        log_error "Environment names cannot contain consecutive dots"
+        return 1
+    fi
+
+    if [ ${#env_name} -gt 128 ]; then
+        log_error "Invalid environment name: '$env_name'"
+        log_error "Environment names cannot exceed 128 characters"
+        return 1
+    fi
+
+    return 0
+}
+
+env_name_exists() {
+    local env_name=$1
+    local exclude_config=${2:-}
+
+    for config_file in "$GLOBAL_CONFIG_DIR"/*.conf; do
+        if [ ! -f "$config_file" ]; then
+            continue
+        fi
+        if [ -n "$exclude_config" ] && [ "$config_file" = "$exclude_config" ]; then
+            continue
+        fi
+
+        local existing_env_name=$(read_config_value "$config_file" "ENV_NAME")
+        local status=$(read_config_value "$config_file" "STATUS")
+        if [ "$existing_env_name" = "$env_name" ] && [ "$status" != "deleted" ]; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+generate_unique_env_name() {
+    local base_name=$1
+    local exclude_config=${2:-}
+    local candidate=$base_name
+    local suffix=2
+
+    while env_name_exists "$candidate" "$exclude_config"; do
+        candidate="${base_name}-${suffix}"
+        suffix=$((suffix + 1))
+    done
+
+    echo "$candidate"
+}
+
+get_global_config_for_hash() {
+    local unique_hash=$1
+
+    if [ -z "$unique_hash" ]; then
+        return 1
+    fi
+
+    find "$GLOBAL_CONFIG_DIR" -name "*.conf" -exec grep -l "^UNIQUE_HASH=${unique_hash}$" {} \; 2>/dev/null | head -1
+}
+
+ensure_env_name() {
+    local default_base
+    local current_global_config
+
+    if [ -z "$ENV_NAME" ]; then
+        default_base=$(normalize_env_name "$(basename "$PROJECT_ROOT")")
+        current_global_config=$(get_global_config_for_hash "$UNIQUE_HASH")
+        ENV_NAME=$(generate_unique_env_name "$default_base" "$current_global_config")
+        if [ -f "$CONFIG_FILE" ]; then
+            set_config_value "$CONFIG_FILE" "ENV_NAME" "$ENV_NAME"
+        fi
+    fi
+}
+
+sync_global_env_names() {
+    local config_file
+
+    for config_file in "$GLOBAL_CONFIG_DIR"/*.conf; do
+        if [ ! -f "$config_file" ]; then
+            continue
+        fi
+
+        local env_name=$(read_config_value "$config_file" "ENV_NAME")
+        if [ -n "$env_name" ]; then
+            continue
+        fi
+
+        local project_name=$(read_config_value "$config_file" "PROJECT_NAME")
+        local project_path=$(read_config_value "$config_file" "PROJECT_PATH")
+        local base_name=$(normalize_env_name "${project_name:-cudo-env}")
+        local unique_name=$(generate_unique_env_name "$base_name" "$config_file")
+
+        set_config_value "$config_file" "ENV_NAME" "$unique_name"
+        if [ -n "$project_path" ] && [ -f "$project_path/.cudo/config" ]; then
+            set_config_value "$project_path/.cudo/config" "ENV_NAME" "$unique_name"
+        fi
+    done
+}
+
 
 # Global configuration directory (stores all project information)
 # Use system-wide directory for multi-user support
@@ -65,6 +216,7 @@ PYTHON_VERSION=$PYTHON_VERSION
 IMAGE_NAME=$IMAGE_NAME
 CUDA_VARIANT=$CUDA_VARIANT
 UNIQUE_HASH=$UNIQUE_HASH
+ENV_NAME=$ENV_NAME
 EOF
     log_success "Configuration saved"
 }
@@ -136,16 +288,9 @@ save_to_global() {
                 log_warning "=========================================="
                 
                 # 更新本地配置文件
-                cat > "$CONFIG_FILE" << EOF
-CUDA_VERSION=$CUDA_VERSION
-UBUNTU_VERSION=$UBUNTU_VERSION
-WITH_TOOLKIT=$WITH_TOOLKIT
-PYTHON_VERSION=$PYTHON_VERSION
-IMAGE_NAME=$IMAGE_NAME
-CUDA_VARIANT=$CUDA_VARIANT
-UNIQUE_HASH=$UNIQUE_HASH
-EOF
-                log_success "Configuration saved with new hash"
+                ENV_NAME=$(generate_unique_env_name "$(normalize_env_name "$ENV_NAME")")
+                save_config
+                log_success "Configuration saved with new hash and environment name: $ENV_NAME"
                 
                 # 重新生成 docker-compose.yml 文件以使用新的服务名和镜像名
                 generate_docker_compose "$IMAGE_NAME"
@@ -159,9 +304,19 @@ EOF
             fi
         fi
     fi
+
+    ensure_env_name
+    local current_env_config=$(get_global_config_for_hash "$unique_hash")
+    if env_name_exists "$ENV_NAME" "$current_env_config"; then
+        ENV_NAME=$(generate_unique_env_name "$(normalize_env_name "$ENV_NAME")" "$current_env_config")
+        if [ -f "$CONFIG_FILE" ]; then
+            set_config_value "$CONFIG_FILE" "ENV_NAME" "$ENV_NAME"
+        fi
+    fi
     
     cat > "$global_config_file" << EOF
 PROJECT_NAME=$project_name
+ENV_NAME=$ENV_NAME
 PROJECT_PATH=$PROJECT_ROOT
 CUDA_VERSION=$CUDA_VERSION
 UBUNTU_VERSION=$UBUNTU_VERSION
@@ -195,10 +350,10 @@ update_global_status() {
     # 遍历所有全局配置文件
     for config_file in "$GLOBAL_CONFIG_DIR"/*.conf; do
         if [ -f "$config_file" ]; then
-            source "$config_file"
+            local project_path=$(read_config_value "$config_file" "PROJECT_PATH")
             
             # 检查项目路径是否还存在容器配置文件夹
-            local config_dir="$PROJECT_PATH/.cudo"
+            local config_dir="$project_path/.cudo"
             if [ ! -d "$config_dir" ]; then
                 # 标记为已删除或已移动
                 sed -i "s|STATUS=.*|STATUS=deleted|" "$config_file"
@@ -263,6 +418,7 @@ load_config() {
             log_error "Configuration file is missing UNIQUE_HASH. Please rebuild the project."
             return 1
         fi
+        ensure_env_name
         return 0
     else
         return 1
@@ -657,9 +813,13 @@ build_command() {
     
     # 尝试加载现有配置以保留哈希
     local existing_hash=""
+    local existing_env_name=""
     if [ -f "$CONFIG_FILE" ]; then
+        ENV_NAME=""
+        UNIQUE_HASH=""
         source "$CONFIG_FILE"
         existing_hash="$UNIQUE_HASH"
+        existing_env_name="$ENV_NAME"
     fi
     
     # 解析构建参数
@@ -668,6 +828,8 @@ build_command() {
     local with_toolkit=$DEFAULT_WITH_TOOLKIT
     local python_version=$DEFAULT_PYTHON_VERSION
     local image_name_base=$DEFAULT_IMAGE_NAME_BASE
+    local requested_env_name=""
+    local explicit_env_name=false
     
     while [[ $# -gt 0 ]]; do
         case $1 in
@@ -712,6 +874,19 @@ build_command() {
                 fi
                 shift 2
                 ;;
+            -n|--name)
+                requested_env_name="$2"
+                explicit_env_name=true
+                if ! validate_env_name "$requested_env_name"; then
+                    log_error ""
+                    log_error "Valid environment name examples:"
+                    log_error "  train"
+                    log_error "  cuda-env-1"
+                    log_error "  test.env_123"
+                    exit 1
+                fi
+                shift 2
+                ;;
             *)
                 log_error "Unknown option: $1"
                 usage
@@ -735,6 +910,26 @@ build_command() {
         UNIQUE_HASH=$(openssl rand -hex 4)
         log_info "Generated new hash: $UNIQUE_HASH"
     fi
+
+    local current_global_config=""
+    if [ -n "$UNIQUE_HASH" ]; then
+        current_global_config=$(get_global_config_for_hash "$UNIQUE_HASH")
+    fi
+
+    if [ "$explicit_env_name" = "true" ]; then
+        if env_name_exists "$requested_env_name" "$current_global_config"; then
+            log_error "Environment name already exists: $requested_env_name"
+            log_error "Choose a different name or remove the existing environment first."
+            exit 1
+        fi
+        ENV_NAME="$requested_env_name"
+    elif [ -n "$existing_env_name" ]; then
+        ENV_NAME="$existing_env_name"
+    else
+        local env_name_base
+        env_name_base=$(normalize_env_name "$(basename "$PROJECT_ROOT")")
+        ENV_NAME=$(generate_unique_env_name "$env_name_base" "$current_global_config")
+    fi
     
     # 设置全局变量用于保存配置
     CUDA_VERSION=$cuda_version
@@ -751,6 +946,7 @@ build_command() {
     echo "  CUDA variant: $CUDA_VARIANT"
     echo "  Python version: $PYTHON_VERSION"
     echo "  Image name: $IMAGE_NAME"
+    echo "  Environment name: $ENV_NAME"
     echo "  Project path: $PROJECT_ROOT"
     echo "  Unique hash: $UNIQUE_HASH"
     
@@ -1021,6 +1217,7 @@ config_command() {
         echo "  CUDA variant: $CUDA_VARIANT"
         echo "  Python version: $PYTHON_VERSION"
         echo "  Image name: $IMAGE_NAME"
+        echo "  Environment name: $ENV_NAME"
         echo "  Unique hash: $UNIQUE_HASH"
     else
         log_info "No configuration found, using defaults:"
@@ -1029,8 +1226,209 @@ config_command() {
         echo "  CUDA variant: base"
         echo "  Python version: $DEFAULT_PYTHON_VERSION"
         echo "  Image name base: $DEFAULT_IMAGE_NAME_BASE"
+        echo "  Environment name: $(normalize_env_name "$(basename "$PROJECT_ROOT")")"
         echo "  Note: Actual image name will include a unique hash after build"
     fi
+}
+
+get_container_status_by_hash() {
+    local unique_hash=$1
+    local container_name="cuda-project-${unique_hash}-container"
+
+    if docker ps -a --format "table {{.Names}}\t{{.Status}}" | grep -q "$container_name"; then
+        local status=$(docker ps -a --format "table {{.Names}}\t{{.Status}}" | grep "$container_name" | awk '{print $2}')
+        if [[ "$status" == Up* ]]; then
+            echo "running"
+        else
+            echo "stopped"
+        fi
+    else
+        echo "nonexistent"
+    fi
+}
+
+find_env_configs_by_name() {
+    local target_name=$1
+
+    for config_file in "$GLOBAL_CONFIG_DIR"/*.conf; do
+        if [ ! -f "$config_file" ]; then
+            continue
+        fi
+
+        local env_name=$(read_config_value "$config_file" "ENV_NAME")
+        local status=$(read_config_value "$config_file" "STATUS")
+        local project_path=$(read_config_value "$config_file" "PROJECT_PATH")
+
+        if [ "$env_name" = "$target_name" ] && [ "$status" != "deleted" ] && [ -d "$project_path/.cudo" ]; then
+            echo "$config_file"
+        fi
+    done
+}
+
+select_env_interactive() {
+    SELECTED_ENV_CONFIG=""
+    local configs=()
+    local index=1
+
+    echo "Available CUDA environments:"
+    printf "%-4s %-24s %-14s %s\n" "NO." "NAME" "STATUS" "PATH"
+
+    for config_file in "$GLOBAL_CONFIG_DIR"/*.conf; do
+        if [ ! -f "$config_file" ]; then
+            continue
+        fi
+
+        local env_name=$(read_config_value "$config_file" "ENV_NAME")
+        local status=$(read_config_value "$config_file" "STATUS")
+        local project_path=$(read_config_value "$config_file" "PROJECT_PATH")
+        local unique_hash=$(read_config_value "$config_file" "UNIQUE_HASH")
+
+        if [ "$status" = "deleted" ] || [ ! -d "$project_path/.cudo" ]; then
+            continue
+        fi
+
+        local container_status=$(get_container_status_by_hash "$unique_hash")
+        configs+=("$config_file")
+        printf "%-4s %-24s %-14s %s\n" "$index" "$env_name" "$container_status" "$project_path"
+        index=$((index + 1))
+    done
+
+    if [ ${#configs[@]} -eq 0 ]; then
+        log_error "No active Cudo environments found"
+        return 1
+    fi
+
+    local selection
+    echo
+    read -r -p "Select environment number: " selection
+
+    if ! [[ "$selection" =~ ^[0-9]+$ ]] || [ "$selection" -lt 1 ] || [ "$selection" -gt ${#configs[@]} ]; then
+        log_error "Invalid selection: $selection"
+        return 1
+    fi
+
+    SELECTED_ENV_CONFIG="${configs[$((selection - 1))]}"
+    return 0
+}
+
+docker_exec_container() {
+    local container_name=$1
+    shift
+
+    if [ $# -eq 0 ]; then
+        set -- bash
+    fi
+
+    if [ -t 0 ] && [ -t 1 ]; then
+        docker exec -it "$container_name" "$@"
+    else
+        docker exec -i "$container_name" "$@"
+    fi
+}
+
+enter_global_config() {
+    local config_file=$1
+    shift
+
+    local env_name=$(read_config_value "$config_file" "ENV_NAME")
+    local project_path=$(read_config_value "$config_file" "PROJECT_PATH")
+    local image_name=$(read_config_value "$config_file" "IMAGE_NAME")
+    local unique_hash=$(read_config_value "$config_file" "UNIQUE_HASH")
+    local project_config_dir="$project_path/.cudo"
+    local container_name="cuda-project-${unique_hash}-container"
+
+    if [ -z "$env_name" ] || [ -z "$project_path" ] || [ -z "$image_name" ] || [ -z "$unique_hash" ]; then
+        log_error "Environment configuration is incomplete: $config_file"
+        exit 1
+    fi
+
+    if [ ! -d "$project_config_dir" ] || [ ! -f "$project_config_dir/docker-compose.yml" ]; then
+        log_error "Environment '$env_name' is missing its .cudo configuration"
+        log_error "Project path: $project_path"
+        exit 1
+    fi
+
+    if ! check_image_exists "$image_name"; then
+        log_error "=========================================="
+        log_error "Environment is broken!"
+        log_error "=========================================="
+        log_error "Image '$image_name' does not exist."
+        log_error ""
+        log_error "To fix this, rebuild the environment:"
+        log_error "  cd \"$project_path\" && cudo build"
+        log_error "=========================================="
+        exit 1
+    fi
+
+    local status=$(get_container_status_by_hash "$unique_hash")
+    case $status in
+        "running")
+            log_info "Entering environment: $env_name"
+            docker_exec_container "$container_name" "$@"
+            ;;
+        "stopped"|"nonexistent")
+            log_info "Starting environment: $env_name"
+            cd "$project_config_dir"
+            docker_compose_cmd up -d
+            sleep 2
+            docker_exec_container "$container_name" "$@"
+            ;;
+    esac
+}
+
+enter_command() {
+    local target_name=""
+    local exec_args=()
+
+    if [ $# -gt 0 ]; then
+        if [ "$1" = "--" ]; then
+            shift
+            exec_args=("$@")
+        else
+            target_name="$1"
+            shift
+
+            if [ $# -gt 0 ]; then
+                if [ "$1" != "--" ]; then
+                    log_error "Unexpected argument: $1"
+                    log_error "Use '--' before commands, for example: cudo enter $target_name -- nvidia-smi"
+                    exit 1
+                fi
+                shift
+                exec_args=("$@")
+            fi
+        fi
+    fi
+
+    local selected_config=""
+    if [ -n "$target_name" ]; then
+        if ! validate_env_name "$target_name"; then
+            exit 1
+        fi
+
+        local matches=()
+        mapfile -t matches < <(find_env_configs_by_name "$target_name")
+
+        if [ ${#matches[@]} -eq 0 ]; then
+            log_error "Cudo environment not found: $target_name"
+            log_info "Run 'cudo list' to see available environments."
+            exit 1
+        fi
+
+        if [ ${#matches[@]} -gt 1 ]; then
+            log_error "Multiple environments match '$target_name'. Run 'cudo list' and clean up duplicates."
+            exit 1
+        fi
+
+        selected_config="${matches[0]}"
+    else
+        if ! select_env_interactive; then
+            exit 1
+        fi
+        selected_config="$SELECTED_ENV_CONFIG"
+    fi
+
+    enter_global_config "$selected_config" "${exec_args[@]}"
 }
 
 # 列出所有 CUDA 环境
@@ -1040,11 +1438,14 @@ list_command() {
     
     # 使用简化版本的 Python 脚本来显示表格
     local python_script="$PYTHON_SCRIPT_DIR/cuda-env-list-simple.py"
+    if [ ! -f "$python_script" ] && [ -f "$SCRIPT_DIR/cuda-env-list-simple.py" ]; then
+        python_script="$SCRIPT_DIR/cuda-env-list-simple.py"
+    fi
     
     if [ ! -f "$python_script" ]; then
         log_error "Python list script not found: $python_script"
         log_info "Please ensure the Python script is installed in the correct location"
-        log_info "Expected location: $PYTHON_SCRIPT_DIR/cuda-env-list-simple.py"
+        log_info "Expected location: $PYTHON_SCRIPT_DIR/cuda-env-list-simple.py or $SCRIPT_DIR/cuda-env-list-simple.py"
         return 1
     fi
     
@@ -1069,6 +1470,7 @@ Usage: cudo <command> [options]
 Commands:
   build [options]    Build CUDA environment image
   run                Start and enter container
+  enter [name]       Enter a Cudo environment from any directory
   status             Check container status
   start              Start container
   stop               Stop container
@@ -1088,6 +1490,7 @@ Build options:
   -t, --with-toolkit     Include CUDA Toolkit (flag, no value needed) (default: $DEFAULT_WITH_TOOLKIT)
   -p, --python-version   Python version (default: $DEFAULT_PYTHON_VERSION)
   -i, --image-name       Image name (default: based on project name)
+  -n, --name             Environment name used by cudo enter
 
 List options:
   -d, --details      Show detailed resource information (CPU, memory usage, etc.)
@@ -1095,7 +1498,10 @@ List options:
 
 Examples:
   cudo build -c 11.8.0 -p 3.8
+  cudo build --name train
   cudo run
+  cudo enter train
+  cudo enter train -- nvidia-smi
   cudo commit
   cudo restore
   cudo restart
@@ -1116,6 +1522,7 @@ main() {
     
     # 每次执行命令时都更新全局状态
     update_global_status
+    sync_global_env_names
     
     case $command in
         "build")
@@ -1123,6 +1530,9 @@ main() {
             ;;
         "run")
             run_command "$@"
+            ;;
+        "enter")
+            enter_command "$@"
             ;;
         "logs")
             logs_command "$@"

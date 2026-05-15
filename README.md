@@ -10,6 +10,7 @@ A powerful command-line tool for managing CUDA development environments using Do
 - **Docker-based Environments**: Isolated CUDA development environments using Docker containers
 - **One-Click Setup**: Build CUDA environments with a single command
 - **Global Management**: Track and monitor all your CUDA projects
+- **Quick Container Entry**: Enter any named Cudo environment from any directory
 - **Resource Monitoring**: Real-time CPU, memory, and GPU usage tracking
 - **Conflict Resolution**: Smart handling of projects with identical names
 - **Multi-Project Support**: Manage multiple CUDA projects simultaneously
@@ -96,6 +97,11 @@ cudo run
 cudo list
 ```
 
+### 5. Enter the environment from anywhere
+```bash
+cudo enter my-cuda-project
+```
+
 ## 📖 Usage
 
 ### Build Command
@@ -111,12 +117,24 @@ cudo build -t
 
 # Custom image name
 cudo build -i my-custom-image
+
+# Custom environment name for cudo enter
+cudo build --name train
 ```
 
-### Run Command
+### Run and Enter Commands
 ```bash
 # Start and enter container
 cudo run
+
+# Enter a named Cudo environment from any directory
+cudo enter train
+
+# Select an environment interactively
+cudo enter
+
+# Run a command inside a named environment
+cudo enter train -- nvidia-smi
 
 # Check container status
 cudo status
@@ -169,13 +187,14 @@ This command removes project configurations that are marked as deleted in the gl
 | `-t, --with-toolkit` | Include CUDA Toolkit | false |
 | `-p, --python-version` | Python version | 3.10 |
 | `-i, --image-name` | Custom image name | auto-generated |
+| `-n, --name` | Environment name for `cudo enter` | project directory name |
 
 ## 📊 Example Output
 
 ### List Command Output
 ```
 CUDA Environment List
-PROJECT     CUDA    UBUNTU  PYTHON  STATUS     PATH
+NAME        CUDA    UBUNTU  PYTHON  STATUS     PATH
 my-project  11.8.0  20.04   3.10    Running    /home/user/projects/my-project
 test-env    12.4.0  20.04   3.10    Stopped    /home/user/projects/test-env
 
