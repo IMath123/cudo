@@ -195,11 +195,15 @@ main() {
     log_success "Installation completed successfully!"
     echo
     echo "Usage examples:"
-    echo "  cudo --help"
     echo "  cudo build -c 11.8.0 -p 3.10"
+    echo "  cudo run"
+    echo "  cudo enter <environment-name>"
+    echo "  cudo enter <environment-name> -- nvidia-smi"
     echo "  cudo list"
+    echo "  cudo rename <old-name> <new-name>"
     echo
     echo "For more information, see:"
+    echo "  cudo --help"
     echo "  https://github.com/IMath123/cudo"
 }
 
