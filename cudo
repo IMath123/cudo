@@ -1431,6 +1431,58 @@ enter_command() {
     enter_global_config "$selected_config" "${exec_args[@]}"
 }
 
+rename_command() {
+    if [ $# -ne 2 ]; then
+        log_error "Usage: cudo rename <origin_name> <new_name>"
+        exit 1
+    fi
+
+    local origin_name=$1
+    local new_name=$2
+
+    if ! validate_env_name "$origin_name"; then
+        exit 1
+    fi
+    if ! validate_env_name "$new_name"; then
+        exit 1
+    fi
+
+    local matches=()
+    mapfile -t matches < <(find_env_configs_by_name "$origin_name")
+
+    if [ ${#matches[@]} -eq 0 ]; then
+        log_error "Cudo environment not found: $origin_name"
+        log_info "Run 'cudo list' to see available environments."
+        exit 1
+    fi
+
+    if [ ${#matches[@]} -gt 1 ]; then
+        log_error "Multiple environments match '$origin_name'. Run 'cudo list' and clean up duplicates."
+        exit 1
+    fi
+
+    local config_file="${matches[0]}"
+    if [ "$origin_name" = "$new_name" ]; then
+        log_info "Environment name is already '$new_name'"
+        return 0
+    fi
+
+    if env_name_exists "$new_name" "$config_file"; then
+        log_error "Environment name already exists: $new_name"
+        log_error "Choose a different name or remove the existing environment first."
+        exit 1
+    fi
+
+    local project_path=$(read_config_value "$config_file" "PROJECT_PATH")
+    set_config_value "$config_file" "ENV_NAME" "$new_name"
+
+    if [ -n "$project_path" ] && [ -f "$project_path/.cudo/config" ]; then
+        set_config_value "$project_path/.cudo/config" "ENV_NAME" "$new_name"
+    fi
+
+    log_success "Renamed environment '$origin_name' to '$new_name'"
+}
+
 # 列出所有 CUDA 环境
 list_command() {
     local show_details=${1:-false}
@@ -1471,6 +1523,7 @@ Commands:
   build [options]    Build CUDA environment image
   run                Start and enter container
   enter [name]       Enter a Cudo environment from any directory
+  rename <old> <new> Rename a Cudo environment
   status             Check container status
   start              Start container
   stop               Stop container
@@ -1502,6 +1555,7 @@ Examples:
   cudo run
   cudo enter train
   cudo enter train -- nvidia-smi
+  cudo rename train training
   cudo commit
   cudo restore
   cudo restart
@@ -1533,6 +1587,9 @@ main() {
             ;;
         "enter")
             enter_command "$@"
+            ;;
+        "rename")
+            rename_command "$@"
             ;;
         "logs")
             logs_command "$@"

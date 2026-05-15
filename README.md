@@ -136,6 +136,9 @@ cudo enter
 # Run a command inside a named environment
 cudo enter train -- nvidia-smi
 
+# Rename a Cudo environment
+cudo rename train training
+
 # Check container status
 cudo status
 
