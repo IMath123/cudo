@@ -83,8 +83,6 @@ def get_gpu_memory_usage(container_name):
         else:
             return 'N/A'
             
-    except subprocess.CalledProcessError:
-        return 'N/A'
     except Exception:
         return 'N/A'
 
@@ -165,7 +163,7 @@ def get_system_memory():
             if len(memory_line) >= 2:
                 return memory_line[1]  # Total memory
         return 'N/A'
-    except subprocess.CalledProcessError:
+    except Exception:
         return 'N/A'
 
 def main():
@@ -222,6 +220,7 @@ def main():
             'ubuntu_version': config.get('UBUNTU_VERSION', 'N/A'),
             'python_version': config.get('PYTHON_VERSION', 'N/A'),
             'status': formatted_status,
+            'ssh_port': config.get('SSH_PORT') or '-',
             'project_path': project_path,
             'cpu_usage': cpu_usage,
             'mem_usage': mem_usage,
@@ -244,7 +243,7 @@ def main():
             mode_name += " with GPU"
         print(f"CUDA Environment List ({mode_name})")
         
-        headers = ["NAME", "CUDA", "UBUNTU", "PYTHON", "STATUS", "CPU", "MEMORY"]
+        headers = ["NAME", "CUDA", "UBUNTU", "PYTHON", "STATUS", "SSH", "CPU", "MEMORY"]
         if show_gpu:
             headers.append("GPU MEM")
         headers.append("CREATED")
@@ -258,6 +257,7 @@ def main():
                 env['ubuntu_version'],
                 env['python_version'],
                 env['status'],
+                env['ssh_port'],
                 env['cpu_usage'],
                 env['mem_usage']
             ]
@@ -276,7 +276,7 @@ def main():
     else:
         # Simple mode
         print("CUDA Environment List")
-        headers = ["NAME", "CUDA", "UBUNTU", "PYTHON", "STATUS", "PATH"]
+        headers = ["NAME", "CUDA", "UBUNTU", "PYTHON", "STATUS", "SSH", "PATH"]
         
         # Prepare data for formatting
         table_data = []
@@ -287,6 +287,7 @@ def main():
                 env['ubuntu_version'],
                 env['python_version'],
                 env['status'],
+                env['ssh_port'],
                 shorten_path(env['project_path'])
             ])
         

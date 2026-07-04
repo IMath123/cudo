@@ -127,8 +127,17 @@ cudo build --name train
 # Start and enter container
 cudo run
 
+# Start SSH on host port 2222 with password login
+cudo run --ssh-port 2222 --ssh-password my-password
+
+# Reuse the saved SSH password and change only the port
+cudo start --ssh-port 2223
+
 # Enter a named Cudo environment from any directory
 cudo enter train
+
+# Enter and update SSH settings for that environment
+cudo enter train --ssh-port 2224 --ssh-password my-password
 
 # Select an environment interactively
 cudo enter
@@ -161,6 +170,10 @@ cudo logs
 cudo remove
 ```
 
+Cudo images always include SSH support. SSH starts only after a port and password are configured with `run`, `start`, or `enter`. If the requested port is already in use, Cudo prompts for another port in interactive terminals.
+
+The SSH password is stored in the Cudo config as base64-encoded text so the shell config remains parseable; do not treat it as encrypted secret storage.
+
 ### List Command
 ```bash
 # Basic list
@@ -191,15 +204,17 @@ This command removes project configurations that are marked as deleted in the gl
 | `-p, --python-version` | Python version | 3.10 |
 | `-i, --image-name` | Custom image name | auto-generated |
 | `-n, --name` | Environment name for `cudo enter` | project directory name |
+| `--ssh-port` | Runtime SSH port for `run`, `start`, or `enter` | unset |
+| `--ssh-password` | Runtime SSH password for `run`, `start`, or `enter` | unset |
 
 ## 📊 Example Output
 
 ### List Command Output
 ```
 CUDA Environment List
-NAME        CUDA    UBUNTU  PYTHON  STATUS     PATH
-my-project  11.8.0  20.04   3.10    Running    /home/user/projects/my-project
-test-env    12.4.0  20.04   3.10    Stopped    /home/user/projects/test-env
+NAME        CUDA    UBUNTU  PYTHON  STATUS     SSH   PATH
+my-project  11.8.0  20.04   3.10    Running    2222  /home/user/projects/my-project
+test-env    12.4.0  20.04   3.10    Stopped    -     /home/user/projects/test-env
 
 Statistics:
   Total environments: 2
@@ -226,6 +241,7 @@ Statistics:
 4. **GPU Access**: Configures NVIDIA runtime for GPU acceleration
 5. **Global Tracking**: Stores project metadata in `/var/lib/cudo-global/`
 6. **Resource Monitoring**: Integrates with Docker stats and NVIDIA tools
+7. **Runtime SSH Access**: Starts `sshd` with password authentication after a port and password are configured
 
 ## 🐛 Troubleshooting
 

@@ -13,6 +13,7 @@ DEFAULT_CUDA_VERSION="12.4.0"
 DEFAULT_UBUNTU_VERSION="20.04"
 DEFAULT_WITH_TOOLKIT="false"
 DEFAULT_PYTHON_VERSION="3.10"
+DEFAULT_SSH_ENABLED="true"
 # 注意：实际的镜像名称会在 build 时加上 UNIQUE_HASH
 DEFAULT_IMAGE_NAME_BASE="cuda-project-$(basename "$PROJECT_ROOT" | tr '[:upper:]' '[:lower:]')"
 
@@ -21,6 +22,7 @@ CONFIG_DIR="$PROJECT_ROOT/.cudo"
 CONFIG_FILE="$CONFIG_DIR/config"
 DOCKERFILE="$CONFIG_DIR/Dockerfile"
 DOCKER_COMPOSE_FILE="$CONFIG_DIR/docker-compose.yml"
+SSH_ENTRYPOINT_FILE="$CONFIG_DIR/cudo-entrypoint.sh"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -44,9 +46,14 @@ set_config_value() {
     local config_file=$1
     local key=$2
     local value=$3
+    local tmp_file="${config_file}.tmp.$$"
 
     if grep -q "^${key}=" "$config_file" 2>/dev/null; then
-        sed -i "s|^${key}=.*|${key}=${value}|" "$config_file"
+        awk -v key="$key" -v value="$value" '
+            BEGIN { prefix = key "=" }
+            index($0, prefix) == 1 { print prefix value; next }
+            { print }
+        ' "$config_file" > "$tmp_file" && mv "$tmp_file" "$config_file"
     else
         echo "${key}=${value}" >> "$config_file"
     fi
@@ -217,6 +224,10 @@ IMAGE_NAME=$IMAGE_NAME
 CUDA_VARIANT=$CUDA_VARIANT
 UNIQUE_HASH=$UNIQUE_HASH
 ENV_NAME=$ENV_NAME
+SSH_ENABLED=$SSH_ENABLED
+SSH_PORT=$SSH_PORT
+SSH_USER=$SSH_USER
+SSH_PASSWORD_B64=$SSH_PASSWORD_B64
 EOF
     log_success "Configuration saved"
 }
@@ -324,6 +335,10 @@ WITH_TOOLKIT=$WITH_TOOLKIT
 PYTHON_VERSION=$PYTHON_VERSION
 IMAGE_NAME=$IMAGE_NAME
 CUDA_VARIANT=$CUDA_VARIANT
+SSH_ENABLED=$SSH_ENABLED
+SSH_PORT=$SSH_PORT
+SSH_USER=$SSH_USER
+SSH_PASSWORD_B64=$SSH_PASSWORD_B64
 CREATED_TIME="$(date '+%Y-%m-%d %H:%M:%S')"
 LAST_UPDATED="$(date '+%Y-%m-%d %H:%M:%S')"
 UNIQUE_HASH=$unique_hash
@@ -356,12 +371,12 @@ update_global_status() {
             local config_dir="$project_path/.cudo"
             if [ ! -d "$config_dir" ]; then
                 # 标记为已删除或已移动
-                sed -i "s|STATUS=.*|STATUS=deleted|" "$config_file"
-                sed -i "s|LAST_UPDATED=.*|LAST_UPDATED=\"$(date '+%Y-%m-%d %H:%M:%S')\"|" "$config_file"
+                set_config_value "$config_file" "STATUS" "deleted"
+                set_config_value "$config_file" "LAST_UPDATED" "\"$(date '+%Y-%m-%d %H:%M:%S')\""
             else
                 # 确保状态是 active
-                sed -i "s|STATUS=.*|STATUS=active|" "$config_file"
-                sed -i "s|LAST_UPDATED=.*|LAST_UPDATED=\"$(date '+%Y-%m-%d %H:%M:%S')\"|" "$config_file"
+                set_config_value "$config_file" "STATUS" "active"
+                set_config_value "$config_file" "LAST_UPDATED" "\"$(date '+%Y-%m-%d %H:%M:%S')\""
             fi
         fi
     done
@@ -418,6 +433,10 @@ load_config() {
             log_error "Configuration file is missing UNIQUE_HASH. Please rebuild the project."
             return 1
         fi
+        SSH_ENABLED=${SSH_ENABLED:-$DEFAULT_SSH_ENABLED}
+        SSH_PORT=${SSH_PORT:-}
+        SSH_USER=${SSH_USER:-$(id -un)}
+        SSH_PASSWORD_B64=${SSH_PASSWORD_B64:-}
         ensure_env_name
         return 0
     else
@@ -471,6 +490,355 @@ check_dependencies() {
     fi
 }
 
+validate_ssh_port() {
+    local port=$1
+
+    if [ -z "$port" ]; then
+        log_error "SSH port is required"
+        return 1
+    fi
+
+    if ! [[ "$port" =~ ^[0-9]+$ ]]; then
+        log_error "Invalid SSH port: '$port'"
+        log_error "SSH port must be a number between 1 and 65535"
+        return 1
+    fi
+
+    if [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+        log_error "Invalid SSH port: '$port'"
+        log_error "SSH port must be between 1 and 65535"
+        return 1
+    fi
+
+    return 0
+}
+
+ssh_port_in_use() {
+    local port=$1
+
+    if command -v ss > /dev/null 2>&1; then
+        ss -H -ltn 2>/dev/null | awk -v suffix=":${port}" '$4 ~ suffix "$" { found=1 } END { exit !found }'
+        return $?
+    fi
+
+    if command -v lsof > /dev/null 2>&1; then
+        lsof -nP -iTCP:"$port" -sTCP:LISTEN > /dev/null 2>&1
+        return $?
+    fi
+
+    if command -v netstat > /dev/null 2>&1; then
+        netstat -an 2>/dev/null | awk -v port="$port" '
+            tolower($1) ~ /^tcp/ && ($NF == "LISTEN" || $NF == "LISTENING") {
+                if ($4 ~ ":" port "$" || $4 ~ "\\." port "$") found=1
+            }
+            END { exit !found }
+        '
+        return $?
+    fi
+
+    (echo > "/dev/tcp/127.0.0.1/$port") > /dev/null 2>&1
+}
+
+ensure_ssh_port_available() {
+    local port=$1
+
+    if ! validate_ssh_port "$port"; then
+        return 1
+    fi
+
+    if ssh_port_in_use "$port"; then
+        log_error "SSH port $port is already in use on the host"
+        log_error "Choose another port or stop the process using this port first"
+        return 1
+    fi
+
+    return 0
+}
+
+base64_encode_value() {
+    printf '%s' "$1" | base64 | tr -d '\n'
+}
+
+read_ssh_password() {
+    local prompt=${1:-"Enter SSH password: "}
+    local password
+
+    if [ ! -t 0 ]; then
+        log_error "SSH password is required. Pass --ssh-password <password> in non-interactive mode."
+        return 1
+    fi
+
+    read -r -s -p "$prompt" password
+    echo
+
+    if [ -z "$password" ]; then
+        log_error "SSH password cannot be empty"
+        return 1
+    fi
+
+    SSH_INPUT_PASSWORD="$password"
+    return 0
+}
+
+resolve_ssh_port_for_start() {
+    local port=$1
+    local check_port=${2:-true}
+
+    while true; do
+        if [ -z "$port" ]; then
+            if [ ! -t 0 ]; then
+                log_error "SSH port is required. Pass --ssh-port <port> in non-interactive mode."
+                return 1
+            fi
+
+            read -r -p "Enter SSH port, or press Enter to skip SSH: " port
+            if [ -z "$port" ]; then
+                SSH_RESOLVED_PORT=""
+                return 0
+            fi
+        fi
+
+        if ! validate_ssh_port "$port"; then
+            if [ ! -t 0 ]; then
+                return 1
+            fi
+            port=""
+            continue
+        fi
+
+        if [ "$check_port" != "true" ] || ! ssh_port_in_use "$port"; then
+            SSH_RESOLVED_PORT="$port"
+            return 0
+        fi
+
+        log_error "SSH port $port is already in use on the host"
+        if [ ! -t 0 ]; then
+            log_error "Run again with --ssh-port <free-port>"
+            return 1
+        fi
+
+        read -r -p "Enter a new SSH port, or press Enter to cancel: " port
+        if [ -z "$port" ]; then
+            log_info "Operation cancelled"
+            return 1
+        fi
+    done
+}
+
+write_docker_compose_file() {
+    local compose_file=$1
+    local image_name=$2
+    local unique_hash=$3
+
+    local service_name="cuda-project-${unique_hash}"
+    local container_name="${service_name}-container"
+
+    cat > "$compose_file" << EOF
+services:
+  ${service_name}:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ${image_name}
+    network_mode: host
+    container_name: ${container_name}
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+    volumes:
+      - ..:/workspace
+      - /tmp/.X11-unix:/tmp/.X11-unix
+      - /dev/shm:/dev/shm
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+EOF
+}
+
+prepare_ssh_build_files() {
+    cat > "$SSH_ENTRYPOINT_FILE" << 'EOF'
+#!/bin/bash
+set -e
+
+load_cudo_ssh_config() {
+    local config_file="/workspace/.cudo/config"
+
+    CUDO_SSH_ENABLED="${CUDO_SSH_ENABLED:-false}"
+    CUDO_SSH_PORT="${CUDO_SSH_PORT:-}"
+    CUDO_SSH_USER="${CUDO_SSH_USER:-$(id -un)}"
+    CUDO_SSH_PASSWORD_B64="${CUDO_SSH_PASSWORD_B64:-}"
+
+    if [ -f "$config_file" ]; then
+        CUDO_SSH_ENABLED=$(grep -m1 '^SSH_ENABLED=' "$config_file" | cut -d'=' -f2- || true)
+        CUDO_SSH_PORT=$(grep -m1 '^SSH_PORT=' "$config_file" | cut -d'=' -f2- || true)
+        CUDO_SSH_USER=$(grep -m1 '^SSH_USER=' "$config_file" | cut -d'=' -f2- || true)
+        CUDO_SSH_PASSWORD_B64=$(grep -m1 '^SSH_PASSWORD_B64=' "$config_file" | cut -d'=' -f2- || true)
+    fi
+
+    CUDO_SSH_ENABLED="${CUDO_SSH_ENABLED:-false}"
+    CUDO_SSH_USER="${CUDO_SSH_USER:-$(id -un)}"
+}
+
+decode_password() {
+    if base64 --help 2>&1 | grep -q -- '--decode'; then
+        printf '%s' "$CUDO_SSH_PASSWORD_B64" | base64 --decode
+    elif base64 -d </dev/null >/dev/null 2>&1; then
+        printf '%s' "$CUDO_SSH_PASSWORD_B64" | base64 -d
+    else
+        printf '%s' "$CUDO_SSH_PASSWORD_B64" | base64 -D
+    fi
+}
+
+configure_cudo_ssh() {
+    load_cudo_ssh_config
+
+    if [ "$CUDO_SSH_ENABLED" != "true" ] || [ -z "$CUDO_SSH_PORT" ] || [ -z "$CUDO_SSH_PASSWORD_B64" ]; then
+        return 0
+    fi
+
+    if ! printf '%s' "$CUDO_SSH_PORT" | grep -Eq '^[0-9]+$'; then
+        echo "Invalid Cudo SSH port: $CUDO_SSH_PORT" >&2
+        exit 1
+    fi
+
+    local password
+    password=$(decode_password)
+
+    sudo mkdir -p /run/sshd /etc/ssh/sshd_config.d
+    if ! grep -q '^Include /etc/ssh/sshd_config.d/\*.conf' /etc/ssh/sshd_config; then
+        printf '%s\n' 'Include /etc/ssh/sshd_config.d/*.conf' | sudo tee /tmp/cudo-sshd-include >/dev/null
+        sudo sh -c 'cat /tmp/cudo-sshd-include /etc/ssh/sshd_config > /etc/ssh/sshd_config.cudo && mv /etc/ssh/sshd_config.cudo /etc/ssh/sshd_config'
+        sudo rm -f /tmp/cudo-sshd-include
+    fi
+
+    printf '%s:%s\n' "$CUDO_SSH_USER" "$password" | sudo chpasswd
+    sudo tee /etc/ssh/sshd_config.d/cudo.conf >/dev/null << CONFIG_EOF
+Port ${CUDO_SSH_PORT}
+ListenAddress 0.0.0.0
+PasswordAuthentication yes
+ChallengeResponseAuthentication no
+PubkeyAuthentication no
+PermitRootLogin no
+PermitEmptyPasswords no
+AllowUsers ${CUDO_SSH_USER}
+CONFIG_EOF
+
+    sudo ssh-keygen -A > /dev/null 2>&1
+    sudo /usr/sbin/sshd -t
+    sudo pkill -x sshd >/dev/null 2>&1 || true
+    sudo /usr/sbin/sshd -E /var/log/cudo-sshd.log
+    echo "Cudo SSH is listening on port ${CUDO_SSH_PORT}"
+}
+
+configure_cudo_ssh
+
+exec "$@"
+EOF
+    chmod 755 "$SSH_ENTRYPOINT_FILE"
+}
+
+update_ssh_runtime_config() {
+    local project_path=$1
+    local image_name=$2
+    local unique_hash=$3
+    local config_file=$4
+    local requested_port=$5
+    local requested_password=$6
+    local password_provided=$7
+    local check_port=$8
+
+    local project_config_dir="$project_path/.cudo"
+    local project_config_file="$project_config_dir/config"
+    local global_config_file
+    local current_port=$(read_config_value "$project_config_file" "SSH_PORT")
+    local current_password_b64=$(read_config_value "$project_config_file" "SSH_PASSWORD_B64")
+    local current_user=$(read_config_value "$project_config_file" "SSH_USER")
+    local password_b64="$current_password_b64"
+    local port="${requested_port:-$current_port}"
+
+    if [ -z "$current_user" ]; then
+        current_user=$(id -un)
+    fi
+
+    if [ -z "$requested_port" ] && [ "$password_provided" != "true" ] && [ -z "$current_port" ] && [ -z "$current_password_b64" ]; then
+        return 0
+    fi
+
+    if ! resolve_ssh_port_for_start "$port" "$check_port"; then
+        return 1
+    fi
+    port="$SSH_RESOLVED_PORT"
+
+    if [ -z "$port" ]; then
+        return 0
+    fi
+
+    if [ "$password_provided" = "true" ]; then
+        if [ -z "$requested_password" ]; then
+            log_error "SSH password cannot be empty"
+            return 1
+        fi
+        password_b64=$(base64_encode_value "$requested_password")
+    elif [ -z "$password_b64" ]; then
+        if ! read_ssh_password "Enter SSH password for $current_user: "; then
+            return 1
+        fi
+        password_b64=$(base64_encode_value "$SSH_INPUT_PASSWORD")
+    fi
+
+    set_config_value "$project_config_file" "SSH_ENABLED" "true"
+    set_config_value "$project_config_file" "SSH_PORT" "$port"
+    set_config_value "$project_config_file" "SSH_USER" "$current_user"
+    set_config_value "$project_config_file" "SSH_PASSWORD_B64" "$password_b64"
+
+    global_config_file="$config_file"
+    if [ "$global_config_file" = "$project_config_file" ]; then
+        global_config_file=$(get_global_config_for_hash "$unique_hash")
+    fi
+
+    if [ -n "$global_config_file" ] && [ -f "$global_config_file" ]; then
+        set_config_value "$global_config_file" "SSH_ENABLED" "true"
+        set_config_value "$global_config_file" "SSH_PORT" "$port"
+        set_config_value "$global_config_file" "SSH_USER" "$current_user"
+        set_config_value "$global_config_file" "SSH_PASSWORD_B64" "$password_b64"
+    fi
+
+    SSH_ENABLED=true
+    SSH_PORT="$port"
+    SSH_USER="$current_user"
+    SSH_PASSWORD_B64="$password_b64"
+    write_docker_compose_file "$project_config_dir/docker-compose.yml" "$image_name" "$unique_hash"
+    SSH_RUNTIME_CONFIGURED=true
+    log_info "SSH configured: user $current_user, port $port"
+}
+
+container_has_ssh_config() {
+    [ "${SSH_ENABLED:-false}" = "true" ] && [ -n "${SSH_PORT:-}" ] && [ -n "${SSH_PASSWORD_B64:-}" ]
+}
+
+configure_running_container_ssh() {
+    local container_name=$1
+
+    if ! container_has_ssh_config; then
+        return 0
+    fi
+
+    if docker exec "$container_name" test -x /usr/local/bin/cudo-entrypoint >/dev/null 2>&1; then
+        docker exec "$container_name" /usr/local/bin/cudo-entrypoint true >/dev/null
+        log_info "SSH is ready: ssh -p $SSH_PORT $SSH_USER@<host>"
+    else
+        log_warning "Container image does not include SSH support. Rebuild with: cudo build"
+    fi
+}
+
 # 生成 Dockerfile
 generate_dockerfile() {
     local cuda_version=$1
@@ -506,6 +874,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \\
     vim \\
     curl \\
     sudo \\
+    openssh-server \\
     && apt-get clean \\
     && rm -rf /var/lib/apt/lists/*
 
@@ -518,6 +887,15 @@ RUN groupadd -g ${current_gid} ${current_user} && \\
     echo "${current_user} ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers.d/${current_user} && \\
     chmod 0440 /etc/sudoers.d/${current_user} && \\
     chown -R ${current_user}:${current_user} /workspace
+
+# 配置运行时 SSH 支持
+COPY cudo-entrypoint.sh /usr/local/bin/cudo-entrypoint
+RUN mkdir -p /run/sshd /etc/ssh/sshd_config.d && \\
+    chmod 755 /usr/local/bin/cudo-entrypoint && \\
+    ssh-keygen -A && \\
+    if ! grep -q '^Include /etc/ssh/sshd_config.d/\\*.conf' /etc/ssh/sshd_config; then \\
+        sed -i '1i Include /etc/ssh/sshd_config.d/*.conf' /etc/ssh/sshd_config; \\
+    fi
 
 # 切换用户（以便以用户身份安装 Miniconda）
 USER ${current_user}
@@ -542,6 +920,7 @@ RUN conda config --set always_yes yes --set changeps1 no && \\
 RUN echo ". /home/${current_user}/miniconda3/etc/profile.d/conda.sh" >> ~/.bashrc && \\
     echo "conda activate base" >> ~/.bashrc
 
+ENTRYPOINT ["/usr/local/bin/cudo-entrypoint"]
 CMD ["/bin/bash"]
 EOF
     log_success "Dockerfile generated"
@@ -554,35 +933,8 @@ generate_docker_compose() {
     # 使用唯一哈希生成所有名称，避免冲突
     local service_name="cuda-project-${UNIQUE_HASH}"
     local container_name="${service_name}-container"
-    
-    cat > "$DOCKER_COMPOSE_FILE" << EOF
-services:
-  ${service_name}:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: ${image_name}
-    network_mode: host
-    container_name: ${container_name}
-    runtime: nvidia
-    environment:
-      - NVIDIA_VISIBLE_DEVICES=all
-      - NVIDIA_DRIVER_CAPABILITIES=all
-    volumes:
-      - ..:/workspace
-      - /tmp/.X11-unix:/tmp/.X11-unix
-      - /dev/shm:/dev/shm
-    working_dir: /workspace
-    stdin_open: true
-    tty: true
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-EOF
+
+    write_docker_compose_file "$DOCKER_COMPOSE_FILE" "$image_name" "$UNIQUE_HASH"
     log_success "docker-compose.yml generated"
     log_info "Service name: ${service_name}"
     log_info "Container name: ${container_name}"
@@ -814,12 +1166,18 @@ build_command() {
     # 尝试加载现有配置以保留哈希
     local existing_hash=""
     local existing_env_name=""
+    local existing_ssh_port=""
+    local existing_ssh_user=""
+    local existing_ssh_password_b64=""
     if [ -f "$CONFIG_FILE" ]; then
         ENV_NAME=""
         UNIQUE_HASH=""
         source "$CONFIG_FILE"
         existing_hash="$UNIQUE_HASH"
         existing_env_name="$ENV_NAME"
+        existing_ssh_port="${SSH_PORT:-}"
+        existing_ssh_user="${SSH_USER:-}"
+        existing_ssh_password_b64="${SSH_PASSWORD_B64:-}"
     fi
     
     # 解析构建参数
@@ -939,6 +1297,11 @@ build_command() {
     # 镜像名称包含哈希值，确保每个项目有独立的镜像
     IMAGE_NAME="${image_name_base}-${UNIQUE_HASH}"
     CUDA_VARIANT=$cuda_variant
+    SSH_ENABLED=true
+    SSH_PORT=$existing_ssh_port
+    SSH_USER=${existing_ssh_user:-$(id -un)}
+    SSH_PASSWORD_B64=$existing_ssh_password_b64
+    prepare_ssh_build_files
     
     echo "Build configuration:"
     echo "  CUDA version: $CUDA_VERSION"
@@ -949,6 +1312,12 @@ build_command() {
     echo "  Environment name: $ENV_NAME"
     echo "  Project path: $PROJECT_ROOT"
     echo "  Unique hash: $UNIQUE_HASH"
+    echo "  SSH support: enabled"
+    if [ -n "$SSH_PORT" ] && [ -n "$SSH_PASSWORD_B64" ]; then
+        echo "  SSH runtime: configured (user: $SSH_USER, port: $SSH_PORT)"
+    else
+        echo "  SSH runtime: not configured"
+    fi
     
     # 检查依赖
     check_dependencies
@@ -972,10 +1341,60 @@ build_command() {
     
     # 保存到全局配置
     save_to_global
+
+    if [ -n "$SSH_PORT" ] && [ -n "$SSH_PASSWORD_B64" ]; then
+        log_info "SSH will start with the container."
+        log_info "Connect with: ssh -p $SSH_PORT $SSH_USER@<host>"
+    else
+        log_info "SSH support is included. Configure it with: cudo run --ssh-port <port> --ssh-password <password>"
+    fi
+}
+
+parse_ssh_runtime_options() {
+    SSH_OPTION_PORT=""
+    SSH_OPTION_PASSWORD=""
+    SSH_OPTION_PASSWORD_PROVIDED=false
+    RUNTIME_REMAINING_ARGS=()
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --ssh-port)
+                if [ $# -lt 2 ]; then
+                    log_error "Missing value for --ssh-port"
+                    exit 1
+                fi
+                SSH_OPTION_PORT="$2"
+                if ! validate_ssh_port "$SSH_OPTION_PORT"; then
+                    exit 1
+                fi
+                shift 2
+                ;;
+            --ssh-password)
+                if [ $# -lt 2 ]; then
+                    log_error "Missing value for --ssh-password"
+                    exit 1
+                fi
+                SSH_OPTION_PASSWORD="$2"
+                SSH_OPTION_PASSWORD_PROVIDED=true
+                shift 2
+                ;;
+            *)
+                RUNTIME_REMAINING_ARGS+=("$1")
+                shift
+                ;;
+        esac
+    done
 }
 
 # 运行命令（进入容器）
 run_command() {
+    parse_ssh_runtime_options "$@"
+    if [ ${#RUNTIME_REMAINING_ARGS[@]} -gt 0 ]; then
+        log_error "Unexpected argument: ${RUNTIME_REMAINING_ARGS[0]}"
+        usage
+        exit 1
+    fi
+
     mkdir -p $CONFIG_DIR
 
     if ! load_config; then
@@ -1007,9 +1426,20 @@ run_command() {
     
     local status=$(check_container_status "$IMAGE_NAME")
     local container_name="cuda-project-${UNIQUE_HASH}-container"
+    local check_ssh_port=true
+    if [ "$status" = "running" ] && [ -z "$SSH_OPTION_PORT" ]; then
+        check_ssh_port=false
+    fi
+
+    SSH_RUNTIME_CONFIGURED=false
+    if ! update_ssh_runtime_config "$PROJECT_ROOT" "$IMAGE_NAME" "$UNIQUE_HASH" "$CONFIG_FILE" "$SSH_OPTION_PORT" "$SSH_OPTION_PASSWORD" "$SSH_OPTION_PASSWORD_PROVIDED" "$check_ssh_port"; then
+        exit 1
+    fi
+
     case $status in
         "running")
             log_info "Entering container..."
+            configure_running_container_ssh "$container_name"
             docker exec -it "$container_name" bash
             ;;
         "stopped")
@@ -1017,6 +1447,7 @@ run_command() {
             cd "$CONFIG_DIR"
             docker_compose_cmd up -d
             sleep 2
+            configure_running_container_ssh "$container_name"
             docker exec -it "$container_name" bash
             ;;
         "nonexistent")
@@ -1024,6 +1455,7 @@ run_command() {
             cd "$CONFIG_DIR"
             docker_compose_cmd up -d
             sleep 2
+            configure_running_container_ssh "$container_name"
             docker exec -it "$container_name" bash
             ;;
     esac
@@ -1052,10 +1484,28 @@ status_command() {
             log_info "Container does not exist"
             ;;
     esac
+
+    if [ "${SSH_ENABLED:-false}" = "true" ]; then
+        echo "SSH support: enabled"
+        if [ -n "${SSH_PORT:-}" ] && [ -n "${SSH_PASSWORD_B64:-}" ]; then
+            echo "SSH runtime: configured (user: $SSH_USER, port: $SSH_PORT)"
+        else
+            echo "SSH runtime: not configured"
+        fi
+    else
+        echo "SSH support: disabled"
+    fi
 }
 
 # 启动命令
 start_command() {
+    parse_ssh_runtime_options "$@"
+    if [ ${#RUNTIME_REMAINING_ARGS[@]} -gt 0 ]; then
+        log_error "Unexpected argument: ${RUNTIME_REMAINING_ARGS[0]}"
+        usage
+        exit 1
+    fi
+
     mkdir -p $CONFIG_DIR
 
     if ! load_config; then
@@ -1065,9 +1515,23 @@ start_command() {
     
     save_to_global
     
+    local status=$(check_container_status "$IMAGE_NAME")
+    local container_name="cuda-project-${UNIQUE_HASH}-container"
+    local check_ssh_port=true
+    if [ "$status" = "running" ] && [ -z "$SSH_OPTION_PORT" ]; then
+        check_ssh_port=false
+    fi
+
+    SSH_RUNTIME_CONFIGURED=false
+    if ! update_ssh_runtime_config "$PROJECT_ROOT" "$IMAGE_NAME" "$UNIQUE_HASH" "$CONFIG_FILE" "$SSH_OPTION_PORT" "$SSH_OPTION_PASSWORD" "$SSH_OPTION_PASSWORD_PROVIDED" "$check_ssh_port"; then
+        exit 1
+    fi
+
     log_info "Starting container..."
     cd "$CONFIG_DIR"
-    docker_compose_cmd start
+    docker_compose_cmd up -d
+    sleep 2
+    configure_running_container_ssh "$container_name"
 }
 
 # 停止命令
@@ -1219,6 +1683,20 @@ config_command() {
         echo "  Image name: $IMAGE_NAME"
         echo "  Environment name: $ENV_NAME"
         echo "  Unique hash: $UNIQUE_HASH"
+        if [ "${SSH_ENABLED:-false}" = "true" ]; then
+            echo "  SSH support: enabled"
+            echo "  SSH user: $SSH_USER"
+            if [ -n "${SSH_PORT:-}" ] && [ -n "${SSH_PASSWORD_B64:-}" ]; then
+                echo "  SSH port: $SSH_PORT"
+                echo "  SSH password: configured"
+                echo "  SSH command: ssh -p $SSH_PORT $SSH_USER@<host>"
+            else
+                echo "  SSH runtime: not configured"
+                echo "  Configure SSH: cudo run --ssh-port <port> --ssh-password <password>"
+            fi
+        else
+            echo "  SSH support: disabled"
+        fi
     else
         log_info "No configuration found, using defaults:"
         echo "  CUDA version: $DEFAULT_CUDA_VERSION"
@@ -1227,6 +1705,7 @@ config_command() {
         echo "  Python version: $DEFAULT_PYTHON_VERSION"
         echo "  Image name base: $DEFAULT_IMAGE_NAME_BASE"
         echo "  Environment name: $(normalize_env_name "$(basename "$PROJECT_ROOT")")"
+        echo "  SSH support: enabled after build"
         echo "  Note: Actual image name will include a unique hash after build"
     fi
 }
@@ -1361,9 +1840,20 @@ enter_global_config() {
     fi
 
     local status=$(get_container_status_by_hash "$unique_hash")
+    local check_ssh_port=true
+    if [ "$status" = "running" ] && [ -z "$SSH_OPTION_PORT" ]; then
+        check_ssh_port=false
+    fi
+
+    SSH_RUNTIME_CONFIGURED=false
+    if ! update_ssh_runtime_config "$project_path" "$image_name" "$unique_hash" "$config_file" "$SSH_OPTION_PORT" "$SSH_OPTION_PASSWORD" "$SSH_OPTION_PASSWORD_PROVIDED" "$check_ssh_port"; then
+        exit 1
+    fi
+
     case $status in
         "running")
             log_info "Entering environment: $env_name"
+            configure_running_container_ssh "$container_name"
             docker_exec_container "$container_name" "$@"
             ;;
         "stopped"|"nonexistent")
@@ -1371,6 +1861,7 @@ enter_global_config() {
             cd "$project_config_dir"
             docker_compose_cmd up -d
             sleep 2
+            configure_running_container_ssh "$container_name"
             docker_exec_container "$container_name" "$@"
             ;;
     esac
@@ -1379,25 +1870,50 @@ enter_global_config() {
 enter_command() {
     local target_name=""
     local exec_args=()
+    SSH_OPTION_PORT=""
+    SSH_OPTION_PASSWORD=""
+    SSH_OPTION_PASSWORD_PROVIDED=false
 
     if [ $# -gt 0 ]; then
-        if [ "$1" = "--" ]; then
-            shift
-            exec_args=("$@")
-        else
-            target_name="$1"
-            shift
-
-            if [ $# -gt 0 ]; then
-                if [ "$1" != "--" ]; then
-                    log_error "Unexpected argument: $1"
-                    log_error "Use '--' before commands, for example: cudo enter $target_name -- nvidia-smi"
-                    exit 1
-                fi
-                shift
-                exec_args=("$@")
-            fi
-        fi
+        while [[ $# -gt 0 ]]; do
+            case $1 in
+                --ssh-port)
+                    if [ $# -lt 2 ]; then
+                        log_error "Missing value for --ssh-port"
+                        exit 1
+                    fi
+                    SSH_OPTION_PORT="$2"
+                    if ! validate_ssh_port "$SSH_OPTION_PORT"; then
+                        exit 1
+                    fi
+                    shift 2
+                    ;;
+                --ssh-password)
+                    if [ $# -lt 2 ]; then
+                        log_error "Missing value for --ssh-password"
+                        exit 1
+                    fi
+                    SSH_OPTION_PASSWORD="$2"
+                    SSH_OPTION_PASSWORD_PROVIDED=true
+                    shift 2
+                    ;;
+                --)
+                    shift
+                    exec_args=("$@")
+                    break
+                    ;;
+                *)
+                    if [ -z "$target_name" ]; then
+                        target_name="$1"
+                        shift
+                    else
+                        log_error "Unexpected argument: $1"
+                        log_error "Use '--' before commands, for example: cudo enter $target_name -- nvidia-smi"
+                        exit 1
+                    fi
+                    ;;
+            esac
+        done
     fi
 
     local selected_config=""
@@ -1407,7 +1923,9 @@ enter_command() {
         fi
 
         local matches=()
-        mapfile -t matches < <(find_env_configs_by_name "$target_name")
+        while IFS= read -r match; do
+            matches+=("$match")
+        done < <(find_env_configs_by_name "$target_name")
 
         if [ ${#matches[@]} -eq 0 ]; then
             log_error "Cudo environment not found: $target_name"
@@ -1448,7 +1966,9 @@ rename_command() {
     fi
 
     local matches=()
-    mapfile -t matches < <(find_env_configs_by_name "$origin_name")
+    while IFS= read -r match; do
+        matches+=("$match")
+    done < <(find_env_configs_by_name "$origin_name")
 
     if [ ${#matches[@]} -eq 0 ]; then
         log_error "Cudo environment not found: $origin_name"
@@ -1545,6 +2065,10 @@ Build options:
   -i, --image-name       Image name (default: based on project name)
   -n, --name             Environment name used by cudo enter
 
+Runtime SSH options for run/start/enter:
+      --ssh-port         Start SSH on the given host port
+      --ssh-password     Password for SSH login
+
 List options:
   -d, --details      Show detailed resource information (CPU, memory usage, etc.)
   -g, --gpu          Show GPU memory usage information
@@ -1552,8 +2076,9 @@ List options:
 Examples:
   cudo build -c 11.8.0 -p 3.8
   cudo build --name train
-  cudo run
-  cudo enter train
+  cudo run --ssh-port 2222 --ssh-password my-password
+  ssh -p 2222 $USER@<host>
+  cudo enter train --ssh-port 2223
   cudo enter train -- nvidia-smi
   cudo rename train training
   cudo commit
