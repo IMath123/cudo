@@ -160,8 +160,8 @@ cudo stop
 # Restart container
 cudo restart
 
-# Reset container (delete and recreate)
-cudo reset
+# Restore container to the last committed image state
+cudo restore
 
 # View logs
 cudo logs
@@ -172,7 +172,7 @@ cudo remove
 
 Cudo images always include SSH support. SSH starts only after a port and password are configured with `run`, `start`, or `enter`. If the requested port is already in use, Cudo prompts for another port in interactive terminals.
 
-The SSH password is stored in the Cudo config as base64-encoded text so the shell config remains parseable; do not treat it as encrypted secret storage.
+The SSH password is stored as a SHA-512 password hash in the Cudo config. Cudo does not configure a default SSH port.
 
 ### List Command
 ```bash
@@ -193,6 +193,14 @@ cudo cleanup
 ```
 
 This command removes project configurations that are marked as deleted in the global registry, helping keep your environment list clean.
+
+### Doctor Command
+```bash
+# Diagnose dependencies and the current project configuration
+cudo doctor
+```
+
+This command only reports `PASS`, `WARN`, and `FAIL` checks. It does not modify your environment.
 
 ## 🔧 Configuration Options
 

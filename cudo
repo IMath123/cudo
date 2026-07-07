@@ -59,6 +59,21 @@ set_config_value() {
     fi
 }
 
+remove_config_value() {
+    local config_file=$1
+    local key=$2
+    local tmp_file="${config_file}.tmp.$$"
+
+    if [ ! -f "$config_file" ]; then
+        return 0
+    fi
+
+    awk -v key="$key" '
+        BEGIN { prefix = key "=" }
+        index($0, prefix) != 1 { print }
+    ' "$config_file" > "$tmp_file" && mv "$tmp_file" "$config_file"
+}
+
 normalize_env_name() {
     local raw_name=$1
     local env_name
@@ -168,6 +183,10 @@ ensure_env_name() {
 }
 
 sync_global_env_names() {
+    if [ "$GLOBAL_CONFIG_WRITABLE" != "true" ]; then
+        return 0
+    fi
+
     local config_file
 
     for config_file in "$GLOBAL_CONFIG_DIR"/*.conf; do
@@ -194,18 +213,30 @@ sync_global_env_names() {
 
 
 # Global configuration directory (stores all project information)
-# Use system-wide directory for multi-user support
-GLOBAL_CONFIG_DIR="/var/lib/cudo-global"
-# Try to create system directory first
-mkdir -p "$GLOBAL_CONFIG_DIR" 2>/dev/null || true
-# Ensure the global directory is writable, otherwise disable the tool
-if [ ! -w "$GLOBAL_CONFIG_DIR" ]; then
+# Use system-wide directory for multi-user support. Tests can override this.
+GLOBAL_CONFIG_DIR="${CUDO_GLOBAL_CONFIG_DIR:-/var/lib/cudo-global}"
+GLOBAL_CONFIG_WRITABLE=false
+if [ -d "$GLOBAL_CONFIG_DIR" ] && [ -w "$GLOBAL_CONFIG_DIR" ]; then
+    GLOBAL_CONFIG_WRITABLE=true
+fi
+
+ensure_global_config_writable() {
+    if [ "$GLOBAL_CONFIG_WRITABLE" = "true" ]; then
+        return 0
+    fi
+
+    mkdir -p "$GLOBAL_CONFIG_DIR" 2>/dev/null || true
+    if [ -d "$GLOBAL_CONFIG_DIR" ] && [ -w "$GLOBAL_CONFIG_DIR" ]; then
+        GLOBAL_CONFIG_WRITABLE=true
+        return 0
+    fi
+
     log_error "Global configuration directory $GLOBAL_CONFIG_DIR is not writable"
     log_error "Please ensure the directory exists and has proper permissions:"
     log_error "  sudo mkdir -p $GLOBAL_CONFIG_DIR"
     log_error "  sudo chmod 777 $GLOBAL_CONFIG_DIR"
-    exit 1
-fi
+    return 1
+}
 
 save_config() {
     # 不在这里生成哈希，哈希应该在 build 时或检测到拷贝时生成
@@ -214,7 +245,7 @@ save_config() {
         log_error "UNIQUE_HASH is not set. This should not happen."
         exit 1
     fi
-    
+
     cat > "$CONFIG_FILE" << EOF
 CUDA_VERSION=$CUDA_VERSION
 UBUNTU_VERSION=$UBUNTU_VERSION
@@ -227,44 +258,48 @@ ENV_NAME=$ENV_NAME
 SSH_ENABLED=$SSH_ENABLED
 SSH_PORT=$SSH_PORT
 SSH_USER=$SSH_USER
-SSH_PASSWORD_B64=$SSH_PASSWORD_B64
+SSH_PASSWORD_HASH_B64=$SSH_PASSWORD_HASH_B64
 EOF
     log_success "Configuration saved"
 }
 
 save_to_global() {
+    if ! ensure_global_config_writable; then
+        exit 1
+    fi
+
     local project_name=$(basename "$PROJECT_ROOT")
     local unique_hash=$UNIQUE_HASH
     local unique_id="${project_name}-${unique_hash}"
     local global_config_file="$GLOBAL_CONFIG_DIR/${unique_id}.conf"
-    
+
     # 获取当前项目目录的 inode
     local current_inode=$(stat -c '%i' "$PROJECT_ROOT" 2>/dev/null || stat -f '%i' "$PROJECT_ROOT" 2>/dev/null)
-    
+
     # 检查是否已存在相同路径的配置
     local existing_config_by_path=$(find "$GLOBAL_CONFIG_DIR" -name "*.conf" -exec grep -l "PROJECT_PATH=$PROJECT_ROOT$" {} \; 2>/dev/null | head -1)
-    
+
     if [ -n "$existing_config_by_path" ]; then
         # 同一路径，只需更新配置，不删除
         log_info "Updating existing configuration for current path"
     fi
-    
+
     # 检查是否已存在相同 unique_hash 的配置（但不同路径）
     local existing_config_by_hash=$(find "$GLOBAL_CONFIG_DIR" -name "*.conf" -exec grep -l "UNIQUE_HASH=$unique_hash$" {} \; 2>/dev/null | head -1)
-    
+
     if [ -n "$existing_config_by_hash" ]; then
         # 获取原始项目路径
         local original_project_path=$(grep "PROJECT_PATH=" "$existing_config_by_hash" | cut -d'=' -f2-)
-        
+
         if [ "$original_project_path" != "$PROJECT_ROOT" ]; then
             # 路径不同，需要判断是移动还是拷贝
-            
+
             # 获取原始路径的 inode（如果路径仍然存在）
             local original_inode=""
             if [ -d "$original_project_path" ]; then
                 original_inode=$(stat -c '%i' "$original_project_path" 2>/dev/null || stat -f '%i' "$original_project_path" 2>/dev/null)
             fi
-            
+
             if [ -n "$original_inode" ] && [ "$original_inode" = "$current_inode" ]; then
                 # inode 相同 → 这是移动操作
                 log_info "Detected project move from $original_project_path to $PROJECT_ROOT"
@@ -278,31 +313,31 @@ save_to_global() {
                 log_warning "Original: $original_project_path"
                 log_warning "Copy: $PROJECT_ROOT"
                 log_warning "=========================================="
-                
+
                 # 生成新的唯一哈希
                 UNIQUE_HASH=$(openssl rand -hex 4)
                 unique_hash=$UNIQUE_HASH
                 unique_id="${project_name}-${unique_hash}"
                 global_config_file="$GLOBAL_CONFIG_DIR/${unique_id}.conf"
-                
+
                 # 更新镜像名称以包含新的哈希
                 # 从旧的 IMAGE_NAME 中提取基础名称（去掉旧哈希）
                 local old_hash=$(grep "UNIQUE_HASH=" "$existing_config_by_hash" | cut -d'=' -f2)
                 local image_name_base="${IMAGE_NAME%-$old_hash}"
                 IMAGE_NAME="${image_name_base}-${UNIQUE_HASH}"
-                
+
                 log_warning "Generated new unique hash: $unique_hash"
                 log_warning "New image name: $IMAGE_NAME"
                 log_warning ""
                 log_warning "IMPORTANT: You must rebuild the image for this copied project!"
                 log_warning "Run: cudo build"
                 log_warning "=========================================="
-                
+
                 # 更新本地配置文件
                 ENV_NAME=$(generate_unique_env_name "$(normalize_env_name "$ENV_NAME")")
                 save_config
                 log_success "Configuration saved with new hash and environment name: $ENV_NAME"
-                
+
                 # 重新生成 docker-compose.yml 文件以使用新的服务名和镜像名
                 generate_docker_compose "$IMAGE_NAME"
                 log_info "Updated docker-compose.yml with new service name and image name"
@@ -324,7 +359,7 @@ save_to_global() {
             set_config_value "$CONFIG_FILE" "ENV_NAME" "$ENV_NAME"
         fi
     fi
-    
+
     cat > "$global_config_file" << EOF
 PROJECT_NAME=$project_name
 ENV_NAME=$ENV_NAME
@@ -338,7 +373,7 @@ CUDA_VARIANT=$CUDA_VARIANT
 SSH_ENABLED=$SSH_ENABLED
 SSH_PORT=$SSH_PORT
 SSH_USER=$SSH_USER
-SSH_PASSWORD_B64=$SSH_PASSWORD_B64
+SSH_PASSWORD_HASH_B64=$SSH_PASSWORD_HASH_B64
 CREATED_TIME="$(date '+%Y-%m-%d %H:%M:%S')"
 LAST_UPDATED="$(date '+%Y-%m-%d %H:%M:%S')"
 UNIQUE_HASH=$unique_hash
@@ -349,11 +384,15 @@ EOF
 }
 
 remove_from_global() {
+    if [ "$GLOBAL_CONFIG_WRITABLE" != "true" ]; then
+        return 0
+    fi
+
     local unique_hash=$UNIQUE_HASH
     local project_name=$(basename "$PROJECT_ROOT")
     local unique_id="${project_name}-${unique_hash}"
     local global_config_file="$GLOBAL_CONFIG_DIR/${unique_id}.conf"
-    
+
     if [ -f "$global_config_file" ]; then
         rm -f "$global_config_file"
         log_success "Removed from global storage: $unique_id"
@@ -362,11 +401,15 @@ remove_from_global() {
 
 # 检查并更新全局配置状态
 update_global_status() {
+    if [ "$GLOBAL_CONFIG_WRITABLE" != "true" ]; then
+        return 0
+    fi
+
     # 遍历所有全局配置文件
     for config_file in "$GLOBAL_CONFIG_DIR"/*.conf; do
         if [ -f "$config_file" ]; then
             local project_path=$(read_config_value "$config_file" "PROJECT_PATH")
-            
+
             # 检查项目路径是否还存在容器配置文件夹
             local config_dir="$project_path/.cudo"
             if [ ! -d "$config_dir" ]; then
@@ -384,24 +427,28 @@ update_global_status() {
 
 # 清理已删除/移动的项目配置
 cleanup_deleted_projects() {
+    if ! ensure_global_config_writable; then
+        return 1
+    fi
+
     local deleted_count=0
-    
+
     # 遍历所有全局配置文件
     for config_file in "$GLOBAL_CONFIG_DIR"/*.conf; do
         if [ -f "$config_file" ]; then
             local status=$(grep "STATUS=" "$config_file" | cut -d'=' -f2)
-            
+
             if [ "$status" = "deleted" ]; then
                 local project_name=$(grep "PROJECT_NAME=" "$config_file" | cut -d'=' -f2)
                 local unique_id=$(grep "UNIQUE_ID=" "$config_file" | cut -d'=' -f2)
-                
+
                 rm -f "$config_file"
                 deleted_count=$((deleted_count + 1))
                 log_info "Removed deleted project: $unique_id"
             fi
         fi
     done
-    
+
     if [ $deleted_count -eq 0 ]; then
         log_info "No deleted projects to clean up"
     else
@@ -411,10 +458,14 @@ cleanup_deleted_projects() {
 
 # 清理旧的全局配置文件（基于项目名称的）
 cleanup_old_global_configs() {
+    if [ "$GLOBAL_CONFIG_WRITABLE" != "true" ]; then
+        return 0
+    fi
+
     local project_name=$(basename "$PROJECT_ROOT")
     local unique_hash=$UNIQUE_HASH
     local current_unique_id="${project_name}-${unique_hash}"
-    
+
     # 查找所有相同项目名称的旧配置文件
     for old_config in "$GLOBAL_CONFIG_DIR/${project_name}.conf"*; do
         if [ -f "$old_config" ] && [[ "$old_config" != *"$current_unique_id.conf" ]]; then
@@ -436,6 +487,7 @@ load_config() {
         SSH_ENABLED=${SSH_ENABLED:-$DEFAULT_SSH_ENABLED}
         SSH_PORT=${SSH_PORT:-}
         SSH_USER=${SSH_USER:-$(id -un)}
+        SSH_PASSWORD_HASH_B64=${SSH_PASSWORD_HASH_B64:-}
         SSH_PASSWORD_B64=${SSH_PASSWORD_B64:-}
         ensure_env_name
         return 0
@@ -468,6 +520,10 @@ check_dependencies() {
         missing+=("envsubst (gettext)")
     fi
 
+    if ! command -v openssl &> /dev/null; then
+        missing+=("openssl")
+    fi
+
     if [ ${#missing[@]} -ne 0 ]; then
         log_error "Missing dependencies: ${missing[*]}"
         echo "Please install the following software:"
@@ -483,6 +539,11 @@ check_dependencies() {
                     echo "  envsubst:"
                     echo "    Ubuntu/Debian: sudo apt-get install gettext"
                     echo "    CentOS/RHEL: sudo yum install gettext"
+                    ;;
+                "openssl")
+                    echo "  OpenSSL:"
+                    echo "    Ubuntu/Debian: sudo apt-get install openssl"
+                    echo "    CentOS/RHEL: sudo yum install openssl"
                     ;;
             esac
         done
@@ -557,6 +618,52 @@ ensure_ssh_port_available() {
 
 base64_encode_value() {
     printf '%s' "$1" | base64 | tr -d '\n'
+}
+
+base64_decode_value() {
+    if base64 --help 2>&1 | grep -q -- '--decode'; then
+        printf '%s' "$1" | base64 --decode
+    elif base64 -d </dev/null >/dev/null 2>&1; then
+        printf '%s' "$1" | base64 -d
+    else
+        printf '%s' "$1" | base64 -D
+    fi
+}
+
+generate_ssh_password_hash_b64() {
+    local password=$1
+    local salt
+    local password_hash
+
+    if ! command -v openssl > /dev/null 2>&1; then
+        log_error "openssl is required to hash SSH passwords"
+        return 1
+    fi
+
+    salt=$(openssl rand -hex 8)
+    password_hash=$(printf '%s\n' "$password" | openssl passwd -6 -stdin -salt "$salt")
+    if [ -z "$password_hash" ]; then
+        log_error "Failed to hash SSH password"
+        return 1
+    fi
+
+    base64_encode_value "$password_hash"
+}
+
+ssh_password_is_configured() {
+    [ -n "${SSH_PASSWORD_HASH_B64:-}" ] || [ -n "${SSH_PASSWORD_B64:-}" ]
+}
+
+password_hash_from_legacy_b64() {
+    local legacy_b64=$1
+    local legacy_password
+
+    if [ -z "$legacy_b64" ]; then
+        return 1
+    fi
+
+    legacy_password=$(base64_decode_value "$legacy_b64")
+    generate_ssh_password_hash_b64 "$legacy_password"
 }
 
 read_ssh_password() {
@@ -674,12 +781,14 @@ load_cudo_ssh_config() {
     CUDO_SSH_ENABLED="${CUDO_SSH_ENABLED:-false}"
     CUDO_SSH_PORT="${CUDO_SSH_PORT:-}"
     CUDO_SSH_USER="${CUDO_SSH_USER:-$(id -un)}"
+    CUDO_SSH_PASSWORD_HASH_B64="${CUDO_SSH_PASSWORD_HASH_B64:-}"
     CUDO_SSH_PASSWORD_B64="${CUDO_SSH_PASSWORD_B64:-}"
 
     if [ -f "$config_file" ]; then
         CUDO_SSH_ENABLED=$(grep -m1 '^SSH_ENABLED=' "$config_file" | cut -d'=' -f2- || true)
         CUDO_SSH_PORT=$(grep -m1 '^SSH_PORT=' "$config_file" | cut -d'=' -f2- || true)
         CUDO_SSH_USER=$(grep -m1 '^SSH_USER=' "$config_file" | cut -d'=' -f2- || true)
+        CUDO_SSH_PASSWORD_HASH_B64=$(grep -m1 '^SSH_PASSWORD_HASH_B64=' "$config_file" | cut -d'=' -f2- || true)
         CUDO_SSH_PASSWORD_B64=$(grep -m1 '^SSH_PASSWORD_B64=' "$config_file" | cut -d'=' -f2- || true)
     fi
 
@@ -687,20 +796,26 @@ load_cudo_ssh_config() {
     CUDO_SSH_USER="${CUDO_SSH_USER:-$(id -un)}"
 }
 
-decode_password() {
+decode_base64_value() {
+    local value=$1
+
     if base64 --help 2>&1 | grep -q -- '--decode'; then
-        printf '%s' "$CUDO_SSH_PASSWORD_B64" | base64 --decode
+        printf '%s' "$value" | base64 --decode
     elif base64 -d </dev/null >/dev/null 2>&1; then
-        printf '%s' "$CUDO_SSH_PASSWORD_B64" | base64 -d
+        printf '%s' "$value" | base64 -d
     else
-        printf '%s' "$CUDO_SSH_PASSWORD_B64" | base64 -D
+        printf '%s' "$value" | base64 -D
     fi
 }
 
 configure_cudo_ssh() {
     load_cudo_ssh_config
 
-    if [ "$CUDO_SSH_ENABLED" != "true" ] || [ -z "$CUDO_SSH_PORT" ] || [ -z "$CUDO_SSH_PASSWORD_B64" ]; then
+    if [ "$CUDO_SSH_ENABLED" != "true" ] || [ -z "$CUDO_SSH_PORT" ]; then
+        return 0
+    fi
+
+    if [ -z "$CUDO_SSH_PASSWORD_HASH_B64" ] && [ -z "$CUDO_SSH_PASSWORD_B64" ]; then
         return 0
     fi
 
@@ -709,8 +824,13 @@ configure_cudo_ssh() {
         exit 1
     fi
 
-    local password
-    password=$(decode_password)
+    local password_hash
+    if [ -n "$CUDO_SSH_PASSWORD_HASH_B64" ]; then
+        password_hash=$(decode_base64_value "$CUDO_SSH_PASSWORD_HASH_B64")
+    else
+        echo "Legacy Cudo SSH password config requires 'cudo run/start/enter --ssh-password' to migrate." >&2
+        return 0
+    fi
 
     sudo mkdir -p /run/sshd /etc/ssh/sshd_config.d
     if ! grep -q '^Include /etc/ssh/sshd_config.d/\*.conf' /etc/ssh/sshd_config; then
@@ -719,7 +839,7 @@ configure_cudo_ssh() {
         sudo rm -f /tmp/cudo-sshd-include
     fi
 
-    printf '%s:%s\n' "$CUDO_SSH_USER" "$password" | sudo chpasswd
+    printf '%s:%s\n' "$CUDO_SSH_USER" "$password_hash" | sudo chpasswd -e
     sudo tee /etc/ssh/sshd_config.d/cudo.conf >/dev/null << CONFIG_EOF
 Port ${CUDO_SSH_PORT}
 ListenAddress 0.0.0.0
@@ -759,16 +879,17 @@ update_ssh_runtime_config() {
     local project_config_file="$project_config_dir/config"
     local global_config_file
     local current_port=$(read_config_value "$project_config_file" "SSH_PORT")
+    local current_password_hash_b64=$(read_config_value "$project_config_file" "SSH_PASSWORD_HASH_B64")
     local current_password_b64=$(read_config_value "$project_config_file" "SSH_PASSWORD_B64")
     local current_user=$(read_config_value "$project_config_file" "SSH_USER")
-    local password_b64="$current_password_b64"
+    local password_hash_b64="$current_password_hash_b64"
     local port="${requested_port:-$current_port}"
 
     if [ -z "$current_user" ]; then
         current_user=$(id -un)
     fi
 
-    if [ -z "$requested_port" ] && [ "$password_provided" != "true" ] && [ -z "$current_port" ] && [ -z "$current_password_b64" ]; then
+    if [ -z "$requested_port" ] && [ "$password_provided" != "true" ] && [ -z "$current_port" ] && [ -z "$current_password_hash_b64" ] && [ -z "$current_password_b64" ]; then
         return 0
     fi
 
@@ -786,18 +907,28 @@ update_ssh_runtime_config() {
             log_error "SSH password cannot be empty"
             return 1
         fi
-        password_b64=$(base64_encode_value "$requested_password")
-    elif [ -z "$password_b64" ]; then
+        if ! password_hash_b64=$(generate_ssh_password_hash_b64 "$requested_password"); then
+            return 1
+        fi
+    elif [ -z "$password_hash_b64" ] && [ -n "$current_password_b64" ]; then
+        if ! password_hash_b64=$(password_hash_from_legacy_b64 "$current_password_b64"); then
+            return 1
+        fi
+        log_info "Migrated legacy SSH password storage to hash format"
+    elif [ -z "$password_hash_b64" ]; then
         if ! read_ssh_password "Enter SSH password for $current_user: "; then
             return 1
         fi
-        password_b64=$(base64_encode_value "$SSH_INPUT_PASSWORD")
+        if ! password_hash_b64=$(generate_ssh_password_hash_b64 "$SSH_INPUT_PASSWORD"); then
+            return 1
+        fi
     fi
 
     set_config_value "$project_config_file" "SSH_ENABLED" "true"
     set_config_value "$project_config_file" "SSH_PORT" "$port"
     set_config_value "$project_config_file" "SSH_USER" "$current_user"
-    set_config_value "$project_config_file" "SSH_PASSWORD_B64" "$password_b64"
+    set_config_value "$project_config_file" "SSH_PASSWORD_HASH_B64" "$password_hash_b64"
+    remove_config_value "$project_config_file" "SSH_PASSWORD_B64"
 
     global_config_file="$config_file"
     if [ "$global_config_file" = "$project_config_file" ]; then
@@ -808,20 +939,22 @@ update_ssh_runtime_config() {
         set_config_value "$global_config_file" "SSH_ENABLED" "true"
         set_config_value "$global_config_file" "SSH_PORT" "$port"
         set_config_value "$global_config_file" "SSH_USER" "$current_user"
-        set_config_value "$global_config_file" "SSH_PASSWORD_B64" "$password_b64"
+        set_config_value "$global_config_file" "SSH_PASSWORD_HASH_B64" "$password_hash_b64"
+        remove_config_value "$global_config_file" "SSH_PASSWORD_B64"
     fi
 
     SSH_ENABLED=true
     SSH_PORT="$port"
     SSH_USER="$current_user"
-    SSH_PASSWORD_B64="$password_b64"
+    SSH_PASSWORD_HASH_B64="$password_hash_b64"
+    SSH_PASSWORD_B64=""
     write_docker_compose_file "$project_config_dir/docker-compose.yml" "$image_name" "$unique_hash"
     SSH_RUNTIME_CONFIGURED=true
     log_info "SSH configured: user $current_user, port $port"
 }
 
 container_has_ssh_config() {
-    [ "${SSH_ENABLED:-false}" = "true" ] && [ -n "${SSH_PORT:-}" ] && [ -n "${SSH_PASSWORD_B64:-}" ]
+    [ "${SSH_ENABLED:-false}" = "true" ] && [ -n "${SSH_PORT:-}" ] && [ -n "${SSH_PASSWORD_HASH_B64:-}" ]
 }
 
 configure_running_container_ssh() {
@@ -845,12 +978,12 @@ generate_dockerfile() {
     local ubuntu_version=$2
     local cuda_variant=$3
     local python_version=$4
-    
+
     # 获取当前用户信息
     local current_user=$(id -un)
     local current_uid=$(id -u)
     local current_gid=$(id -g)
-    
+
     cat > "$DOCKERFILE" << EOF
 FROM nvidia/cuda:${cuda_version}-${cuda_variant}-ubuntu${ubuntu_version}
 
@@ -929,7 +1062,7 @@ EOF
 # 生成 docker-compose.yml
 generate_docker_compose() {
     local image_name=$1
-    
+
     # 使用唯一哈希生成所有名称，避免冲突
     local service_name="cuda-project-${UNIQUE_HASH}"
     local container_name="${service_name}-container"
@@ -944,7 +1077,7 @@ generate_docker_compose() {
 build_image() {
     log_info "Starting image build..."
     cd "$CONFIG_DIR"
-    
+
     if docker_compose_cmd build; then
         log_success "Image build successful!"
         log_info "Image name: $IMAGE_NAME"
@@ -959,17 +1092,17 @@ build_image() {
 get_container_stats() {
     local container_name="cuda-project-${UNIQUE_HASH}-container"
     local stats_output
-    
+
     if docker ps --format "table {{.Names}}" | grep -q "$container_name"; then
         # 获取 CPU 使用率
         local cpu_usage=$(docker stats --no-stream --format "{{.CPUPerc}}" "$container_name" 2>/dev/null | head -1 || echo "N/A")
-        
+
         # 获取内存使用
         local mem_usage=$(docker stats --no-stream --format "{{.MemUsage}}" "$container_name" 2>/dev/null | head -1 || echo "N/A")
-        
+
         # 获取内存限制
         local mem_limit=$(docker stats --no-stream --format "{{.MemPerc}}" "$container_name" 2>/dev/null | head -1 || echo "N/A")
-        
+
         echo "$cpu_usage|$mem_usage|$mem_limit"
     else
         echo "N/A|N/A|N/A"
@@ -980,17 +1113,17 @@ get_container_stats() {
 get_container_info() {
     local container_name="cuda-project-${UNIQUE_HASH}-container"
     local info_output
-    
+
     if docker ps -a --format "table {{.Names}}" | grep -q "$container_name"; then
         # 获取容器状态
         local status=$(docker ps -a --format "table {{.Names}}\t{{.Status}}" | grep "$container_name" | awk '{print $2}')
-        
+
         # 获取创建时间
         local created=$(docker inspect --format='{{.Created}}' "$container_name" 2>/dev/null | cut -d'T' -f1 || echo "N/A")
-        
+
         # 获取端口映射
         local ports=$(docker inspect --format='{{range $p, $conf := .NetworkSettings.Ports}}{{(index $conf 0).HostPort}}->{{$p}} {{end}}' "$container_name" 2>/dev/null || echo "N/A")
-        
+
         echo "$status|$created|$ports"
     else
         echo "nonexistent|N/A|N/A"
@@ -1040,54 +1173,54 @@ check_container_status() {
 # 验证镜像名称
 validate_image_name() {
     local image_name=$1
-    
+
     # Docker 镜像名称规则：
     # - 只能包含小写字母、数字、连字符、下划线和点号
     # - 不能以连字符、下划线或点号开头或结尾
     # - 不能包含连续的点号
-    
+
     # 检查是否只包含允许的字符
     if ! [[ "$image_name" =~ ^[a-z0-9._-]+$ ]]; then
         log_error "Invalid image name: '$image_name'"
         log_error "Image names can only contain lowercase letters, numbers, dots, hyphens, and underscores"
         return 1
     fi
-    
+
     # 检查开头字符
     if [[ "$image_name" =~ ^[._-] ]]; then
         log_error "Invalid image name: '$image_name'"
         log_error "Image names cannot start with a dot, hyphen, or underscore"
         return 1
     fi
-    
+
     # 检查结尾字符
     if [[ "$image_name" =~ [._-]$ ]]; then
         log_error "Invalid image name: '$image_name'"
         log_error "Image names cannot end with a dot, hyphen, or underscore"
         return 1
     fi
-    
+
     # 检查连续的点号
     if [[ "$image_name" =~ \.\. ]]; then
         log_error "Invalid image name: '$image_name'"
         log_error "Image names cannot contain consecutive dots"
         return 1
     fi
-    
+
     # 检查长度（Docker 限制为 128 个字符）
     if [ ${#image_name} -gt 128 ]; then
         log_error "Invalid image name: '$image_name'"
         log_error "Image names cannot exceed 128 characters"
         return 1
     fi
-    
+
     return 0
 }
 
 # 自动补全 CUDA 版本号
 normalize_cuda_version() {
     local cuda_version=$1
-    
+
     # 如果版本号只有两个部分（如 12.4），补全为三个部分（12.4.0）
     if [[ "$cuda_version" =~ ^[0-9]+\.[0-9]+$ ]]; then
         echo "${cuda_version}.0"
@@ -1101,17 +1234,17 @@ check_docker_image_exists() {
     local cuda_version=$1
     local ubuntu_version=$2
     local cuda_variant=$3
-    
+
     local image_name="nvidia/cuda:${cuda_version}-${cuda_variant}-ubuntu${ubuntu_version}"
-    
+
     log_info "Checking if Docker image exists: $image_name"
-    
+
     # 首先检查本地是否有该镜像
     if docker image inspect "$image_name" > /dev/null 2>&1; then
         log_success "Docker image found locally: $image_name"
         return 0
     fi
-    
+
     # 本地没有，直接尝试拉取镜像
     log_info "Image not found locally, pulling from remote registry..."
     if docker pull "$image_name"; then
@@ -1130,44 +1263,45 @@ check_docker_image_exists() {
 # 检查 Python 版本是否有效
 check_python_version() {
     local python_version=$1
-    
+
     # 验证 Python 版本格式 (major.minor)
     if ! [[ "$python_version" =~ ^[0-9]+\.[0-9]+$ ]]; then
         log_error "Invalid Python version format: '$python_version'"
         log_error "Python version should be in format: major.minor (e.g., 3.10, 3.11)"
         return 1
     fi
-    
+
     # 提取主版本和次版本
     local major_version=$(echo "$python_version" | cut -d. -f1)
     local minor_version=$(echo "$python_version" | cut -d. -f2)
-    
+
     # 检查主版本是否为 3
     if [ "$major_version" -ne 3 ]; then
         log_error "Unsupported Python major version: $major_version"
         log_error "Only Python 3.x versions are supported"
         return 1
     fi
-    
+
     # 检查次版本是否在合理范围内 (3.6 到 3.14)
     if [ "$minor_version" -lt 6 ] || [ "$minor_version" -gt 14 ]; then
         log_error "Unsupported Python version: $python_version"
         log_error "Supported Python versions are 3.6 to 3.14"
         return 1
     fi
-    
+
     return 0
 }
 
 # 构建命令
 build_command() {
     mkdir -p $CONFIG_DIR
-    
+
     # 尝试加载现有配置以保留哈希
     local existing_hash=""
     local existing_env_name=""
     local existing_ssh_port=""
     local existing_ssh_user=""
+    local existing_ssh_password_hash_b64=""
     local existing_ssh_password_b64=""
     if [ -f "$CONFIG_FILE" ]; then
         ENV_NAME=""
@@ -1177,9 +1311,10 @@ build_command() {
         existing_env_name="$ENV_NAME"
         existing_ssh_port="${SSH_PORT:-}"
         existing_ssh_user="${SSH_USER:-}"
+        existing_ssh_password_hash_b64="${SSH_PASSWORD_HASH_B64:-}"
         existing_ssh_password_b64="${SSH_PASSWORD_B64:-}"
     fi
-    
+
     # 解析构建参数
     local cuda_version=$DEFAULT_CUDA_VERSION
     local ubuntu_version=$DEFAULT_UBUNTU_VERSION
@@ -1188,7 +1323,7 @@ build_command() {
     local image_name_base=$DEFAULT_IMAGE_NAME_BASE
     local requested_env_name=""
     local explicit_env_name=false
-    
+
     while [[ $# -gt 0 ]]; do
         case $1 in
             -c|--cuda-version)
@@ -1252,14 +1387,14 @@ build_command() {
                 ;;
         esac
     done
-    
+
     # 根据是否包含 toolkit 设置变体
     if [ "$with_toolkit" = "true" ]; then
         local cuda_variant="devel"
     else
         local cuda_variant="base"
     fi
-    
+
     # 如果已有哈希则保留，否则生成新的（必须在设置 IMAGE_NAME 之前）
     if [ -n "$existing_hash" ]; then
         UNIQUE_HASH="$existing_hash"
@@ -1288,7 +1423,7 @@ build_command() {
         env_name_base=$(normalize_env_name "$(basename "$PROJECT_ROOT")")
         ENV_NAME=$(generate_unique_env_name "$env_name_base" "$current_global_config")
     fi
-    
+
     # 设置全局变量用于保存配置
     CUDA_VERSION=$cuda_version
     UBUNTU_VERSION=$ubuntu_version
@@ -1300,9 +1435,18 @@ build_command() {
     SSH_ENABLED=true
     SSH_PORT=$existing_ssh_port
     SSH_USER=${existing_ssh_user:-$(id -un)}
+    SSH_PASSWORD_HASH_B64=$existing_ssh_password_hash_b64
     SSH_PASSWORD_B64=$existing_ssh_password_b64
+    if [ -z "$SSH_PASSWORD_HASH_B64" ] && [ -n "$SSH_PASSWORD_B64" ]; then
+        if SSH_PASSWORD_HASH_B64=$(password_hash_from_legacy_b64 "$SSH_PASSWORD_B64"); then
+            SSH_PASSWORD_B64=""
+            log_info "Migrated legacy SSH password storage to hash format"
+        else
+            exit 1
+        fi
+    fi
     prepare_ssh_build_files
-    
+
     echo "Build configuration:"
     echo "  CUDA version: $CUDA_VERSION"
     echo "  Ubuntu version: $UBUNTU_VERSION"
@@ -1313,36 +1457,36 @@ build_command() {
     echo "  Project path: $PROJECT_ROOT"
     echo "  Unique hash: $UNIQUE_HASH"
     echo "  SSH support: enabled"
-    if [ -n "$SSH_PORT" ] && [ -n "$SSH_PASSWORD_B64" ]; then
+    if [ -n "$SSH_PORT" ] && [ -n "$SSH_PASSWORD_HASH_B64" ]; then
         echo "  SSH runtime: configured (user: $SSH_USER, port: $SSH_PORT)"
     else
         echo "  SSH runtime: not configured"
     fi
-    
+
     # 检查依赖
     check_dependencies
-    
+
     # 检查 Docker 基础镜像是否存在
     if ! check_docker_image_exists "$CUDA_VERSION" "$UBUNTU_VERSION" "$CUDA_VARIANT"; then
         log_error "Build aborted: Base Docker image not available"
         exit 1
     fi
-    
+
     # 生成配置文件
     generate_dockerfile "$CUDA_VERSION" "$UBUNTU_VERSION" "$CUDA_VARIANT" "$PYTHON_VERSION"
     generate_docker_compose "$IMAGE_NAME"
     save_config
-    
+
     # 构建镜像
     build_image
-    
+
     # 清理旧的全局配置文件
     cleanup_old_global_configs
-    
+
     # 保存到全局配置
     save_to_global
 
-    if [ -n "$SSH_PORT" ] && [ -n "$SSH_PASSWORD_B64" ]; then
+    if [ -n "$SSH_PORT" ] && [ -n "$SSH_PASSWORD_HASH_B64" ]; then
         log_info "SSH will start with the container."
         log_info "Connect with: ssh -p $SSH_PORT $SSH_USER@<host>"
     else
@@ -1401,11 +1545,11 @@ run_command() {
         log_error "Configuration file not found, please run build command first: cudo build"
         exit 1
     fi
-    
+
     # 检查拷贝/移动并更新全局配置
     # 这会在检测到拷贝时自动生成新哈希和新镜像名
     save_to_global
-    
+
     # 在检查拷贝后，再检查镜像是否存在
     if ! check_image_exists "$IMAGE_NAME"; then
         log_error "=========================================="
@@ -1423,7 +1567,7 @@ run_command() {
         log_error "=========================================="
         exit 1
     fi
-    
+
     local status=$(check_container_status "$IMAGE_NAME")
     local container_name="cuda-project-${UNIQUE_HASH}-container"
     local check_ssh_port=true
@@ -1469,9 +1613,9 @@ status_command() {
         log_error "Configuration file not found, please run build command first: cudo build"
         exit 1
     fi
-    
+
     save_to_global
-    
+
     local status=$(check_container_status "$IMAGE_NAME")
     case $status in
         "running")
@@ -1487,7 +1631,7 @@ status_command() {
 
     if [ "${SSH_ENABLED:-false}" = "true" ]; then
         echo "SSH support: enabled"
-        if [ -n "${SSH_PORT:-}" ] && [ -n "${SSH_PASSWORD_B64:-}" ]; then
+        if [ -n "${SSH_PORT:-}" ] && ssh_password_is_configured; then
             echo "SSH runtime: configured (user: $SSH_USER, port: $SSH_PORT)"
         else
             echo "SSH runtime: not configured"
@@ -1512,9 +1656,9 @@ start_command() {
         log_error "Configuration file not found, please run build command first: cudo build"
         exit 1
     fi
-    
+
     save_to_global
-    
+
     local status=$(check_container_status "$IMAGE_NAME")
     local container_name="cuda-project-${UNIQUE_HASH}-container"
     local check_ssh_port=true
@@ -1542,9 +1686,9 @@ stop_command() {
         log_error "Configuration file not found, please run build command first: cudo build"
         exit 1
     fi
-    
+
     save_to_global
-    
+
     log_info "Stopping container..."
     cd "$CONFIG_DIR"
     docker_compose_cmd stop
@@ -1558,9 +1702,9 @@ restart_command() {
         log_error "Configuration file not found, please run build command first: cudo build"
         exit 1
     fi
-    
+
     save_to_global
-    
+
     log_info "Restarting container..."
     cd "$CONFIG_DIR"
     docker_compose_cmd restart
@@ -1574,18 +1718,18 @@ commit_command() {
         log_error "Configuration file not found, please run build command first: cudo build"
         exit 1
     fi
-    
+
     save_to_global
-    
+
     local container_name="cuda-project-${UNIQUE_HASH}-container"
-    
+
     # 检查容器是否存在
     if ! docker ps -a --format "table {{.Names}}" | grep -q "$container_name"; then
         log_error "Container '$container_name' does not exist. Cannot commit."
         log_error "Please run 'cudo run' to start the container first."
         exit 1
     fi
-    
+
     # 执行提交
     local commit_msg="Commit by cudo at $(date '+%Y-%m-%d %H:%M:%S')"
     log_info "Committing container $container_name to image $IMAGE_NAME..."
@@ -1609,9 +1753,9 @@ restore_command() {
         log_error "Configuration file not found, please run build command first: cudo build"
         exit 1
     fi
-    
+
     save_to_global
-    
+
     log_warning "This will restore the container to the last commit state"
     log_warning "Project: $PROJECT_ROOT"
     log_warning "Image: $IMAGE_NAME"
@@ -1621,7 +1765,7 @@ restore_command() {
         log_info "Operation cancelled"
         exit 0
     fi
-    
+
     log_info "Resetting container (delete and recreate)..."
     cd "$CONFIG_DIR"
     docker_compose_cmd down
@@ -1635,9 +1779,9 @@ logs_command() {
         log_error "Configuration file not found, please run build command first: cudo build"
         exit 1
     fi
-    
+
     save_to_global
-    
+
     cd "$CONFIG_DIR"
     docker_compose_cmd logs -f
 }
@@ -1650,9 +1794,9 @@ remove_command() {
         log_error "Configuration file not found, please run build command first: cudo build"
         exit 1
     fi
-    
+
     save_to_global
-    
+
     log_warning "This will delete the container, image, and all configuration files"
     log_warning "Project: $PROJECT_ROOT"
     log_warning "Image: $IMAGE_NAME"
@@ -1662,7 +1806,7 @@ remove_command() {
         log_info "Operation cancelled"
         exit 0
     fi
-    
+
     log_info "Cleaning up container and image..."
     cd "$CONFIG_DIR"
     docker_compose_cmd down 2>/dev/null || true
@@ -1686,7 +1830,7 @@ config_command() {
         if [ "${SSH_ENABLED:-false}" = "true" ]; then
             echo "  SSH support: enabled"
             echo "  SSH user: $SSH_USER"
-            if [ -n "${SSH_PORT:-}" ] && [ -n "${SSH_PASSWORD_B64:-}" ]; then
+            if [ -n "${SSH_PORT:-}" ] && ssh_password_is_configured; then
                 echo "  SSH port: $SSH_PORT"
                 echo "  SSH password: configured"
                 echo "  SSH command: ssh -p $SSH_PORT $SSH_USER@<host>"
@@ -2007,20 +2151,20 @@ rename_command() {
 list_command() {
     local show_details=${1:-false}
     local show_gpu=${2:-false}
-    
+
     # 使用简化版本的 Python 脚本来显示表格
     local python_script="$PYTHON_SCRIPT_DIR/cuda-env-list-simple.py"
     if [ ! -f "$python_script" ] && [ -f "$SCRIPT_DIR/cuda-env-list-simple.py" ]; then
         python_script="$SCRIPT_DIR/cuda-env-list-simple.py"
     fi
-    
+
     if [ ! -f "$python_script" ]; then
         log_error "Python list script not found: $python_script"
         log_info "Please ensure the Python script is installed in the correct location"
         log_info "Expected location: $PYTHON_SCRIPT_DIR/cuda-env-list-simple.py or $SCRIPT_DIR/cuda-env-list-simple.py"
         return 1
     fi
-    
+
     local args=""
     if [ "$show_details" = "true" ]; then
         args="$args --details"
@@ -2028,8 +2172,160 @@ list_command() {
     if [ "$show_gpu" = "true" ]; then
         args="$args --gpu"
     fi
-    
+
     python3 "$python_script" $args
+}
+
+DOCTOR_FAIL_COUNT=0
+DOCTOR_WARN_COUNT=0
+
+doctor_pass() {
+    echo "PASS  $1"
+}
+
+doctor_warn() {
+    DOCTOR_WARN_COUNT=$((DOCTOR_WARN_COUNT + 1))
+    echo "WARN  $1"
+}
+
+doctor_fail() {
+    DOCTOR_FAIL_COUNT=$((DOCTOR_FAIL_COUNT + 1))
+    echo "FAIL  $1"
+}
+
+doctor_command() {
+    DOCTOR_FAIL_COUNT=0
+    DOCTOR_WARN_COUNT=0
+
+    echo "Cudo doctor"
+    echo "Project: $PROJECT_ROOT"
+    echo "Global config: $GLOBAL_CONFIG_DIR"
+    echo
+
+    if command -v docker > /dev/null 2>&1; then
+        doctor_pass "docker command found: $(docker --version 2>/dev/null | head -1)"
+        if docker info > /dev/null 2>&1; then
+            doctor_pass "Docker daemon is available"
+            if docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -q 'nvidia'; then
+                doctor_pass "NVIDIA Docker runtime is visible"
+            else
+                doctor_warn "NVIDIA Docker runtime was not found in docker info"
+            fi
+        else
+            doctor_fail "Docker daemon is not available"
+        fi
+    else
+        doctor_fail "docker command not found"
+    fi
+
+    if command -v docker > /dev/null 2>&1 && docker compose version > /dev/null 2>&1; then
+        doctor_pass "Docker Compose v2 is available"
+    elif command -v docker-compose > /dev/null 2>&1; then
+        doctor_pass "docker-compose v1 is available"
+    else
+        doctor_fail "Docker Compose is not available"
+    fi
+
+    if command -v envsubst > /dev/null 2>&1; then
+        doctor_pass "envsubst is available"
+    else
+        doctor_fail "envsubst is missing; install gettext"
+    fi
+
+    if command -v openssl > /dev/null 2>&1; then
+        if openssl passwd -help 2>&1 | grep -q -- ' -6 '; then
+            doctor_pass "openssl supports SHA-512 password hashes"
+        else
+            doctor_fail "openssl passwd does not support -6"
+        fi
+    else
+        doctor_fail "openssl is missing"
+    fi
+
+    if [ -d "$GLOBAL_CONFIG_DIR" ]; then
+        if [ -w "$GLOBAL_CONFIG_DIR" ]; then
+            doctor_pass "Global config directory is writable"
+        else
+            doctor_fail "Global config directory is not writable: $GLOBAL_CONFIG_DIR"
+        fi
+    else
+        local global_parent
+        global_parent=$(dirname "$GLOBAL_CONFIG_DIR")
+        if [ -d "$global_parent" ] && [ -w "$global_parent" ]; then
+            doctor_warn "Global config directory does not exist yet; Cudo can create it when needed"
+        else
+            doctor_fail "Global config directory does not exist and parent is not writable: $GLOBAL_CONFIG_DIR"
+        fi
+    fi
+
+    echo
+    if [ -f "$CONFIG_FILE" ]; then
+        local unique_hash=$(read_config_value "$CONFIG_FILE" "UNIQUE_HASH")
+        local image_name=$(read_config_value "$CONFIG_FILE" "IMAGE_NAME")
+        local ssh_port=$(read_config_value "$CONFIG_FILE" "SSH_PORT")
+        local ssh_password_hash=$(read_config_value "$CONFIG_FILE" "SSH_PASSWORD_HASH_B64")
+        local legacy_ssh_password=$(read_config_value "$CONFIG_FILE" "SSH_PASSWORD_B64")
+
+        doctor_pass "Project config found: $CONFIG_FILE"
+
+        if [ -n "$unique_hash" ]; then
+            doctor_pass "Project unique hash: $unique_hash"
+        else
+            doctor_fail "Project config is missing UNIQUE_HASH"
+        fi
+
+        if [ -n "$image_name" ]; then
+            if command -v docker > /dev/null 2>&1 && docker image inspect "$image_name" > /dev/null 2>&1; then
+                doctor_pass "Docker image exists: $image_name"
+            else
+                doctor_warn "Docker image is not present locally: $image_name"
+            fi
+        else
+            doctor_fail "Project config is missing IMAGE_NAME"
+        fi
+
+        if [ -n "$unique_hash" ] && command -v docker > /dev/null 2>&1 && docker info > /dev/null 2>&1; then
+            local container_name="cuda-project-${unique_hash}-container"
+            if docker ps -a --format '{{.Names}}' | grep -qx "$container_name"; then
+                doctor_pass "Container exists: $container_name"
+            else
+                doctor_warn "Container does not exist yet: $container_name"
+            fi
+        fi
+
+        if [ -n "$ssh_port" ]; then
+            if validate_ssh_port "$ssh_port" > /dev/null 2>&1; then
+                if ssh_port_in_use "$ssh_port"; then
+                    doctor_warn "SSH port $ssh_port is currently in use"
+                else
+                    doctor_pass "SSH port $ssh_port is valid and available"
+                fi
+            else
+                doctor_fail "SSH port is invalid: $ssh_port"
+            fi
+        else
+            doctor_pass "SSH port is unset; no default port is configured"
+        fi
+
+        if [ -n "$ssh_password_hash" ]; then
+            doctor_pass "SSH password is stored as a hash"
+        elif [ -n "$legacy_ssh_password" ]; then
+            doctor_warn "Legacy SSH_PASSWORD_B64 found; it will be migrated on next SSH configuration"
+        elif [ -n "$ssh_port" ]; then
+            doctor_warn "SSH port is set but SSH password hash is missing"
+        else
+            doctor_pass "SSH password is unset"
+        fi
+    else
+        doctor_warn "No project config found in current directory"
+    fi
+
+    echo
+    echo "Doctor summary: $DOCTOR_FAIL_COUNT fail(s), $DOCTOR_WARN_COUNT warning(s)"
+    if [ "$DOCTOR_FAIL_COUNT" -gt 0 ]; then
+        return 1
+    fi
+    return 0
 }
 
 # 显示用法
@@ -2054,6 +2350,7 @@ Commands:
   remove             Delete container, image and configuration files
   config             Show current configuration
   list [options]     List all CUDA environments
+  doctor             Diagnose Cudo dependencies and current project config
   cleanup            Clean up deleted/moved project configurations
   help               Show this help message
 
@@ -2089,6 +2386,7 @@ Examples:
   cudo config
   cudo list
   cudo list --details
+  cudo doctor
   cudo cleanup
   cudo remove
 EOF
@@ -2098,11 +2396,16 @@ EOF
 main() {
     local command=$1
     shift
-    
-    # 每次执行命令时都更新全局状态
-    update_global_status
-    sync_global_env_names
-    
+
+    case $command in
+        "doctor"|"help"|"-h"|"--help"|""|"list"|"config")
+            ;;
+        *)
+            update_global_status
+            sync_global_env_names
+            ;;
+    esac
+
     case $command in
         "build")
             build_command "$@"
@@ -2165,6 +2468,9 @@ main() {
                 esac
             done
             list_command "$show_details" "$show_gpu"
+            ;;
+        "doctor")
+            doctor_command
             ;;
         "cleanup")
             cleanup_deleted_projects
