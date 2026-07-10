@@ -145,6 +145,9 @@ case "$1" in
                 echo "Docker Compose version v2.99.0"
                 ;;
             build|up|stop|restart|down|logs)
+                if [ "${2:-}" = "up" ] && [ "${CUDO_FAKE_COMPOSE_FAIL:-false}" = "true" ]; then
+                    exit 1
+                fi
                 ;;
             *)
                 ;;
@@ -162,11 +165,19 @@ case "$1" in
         ;;
     ps)
         if printf '%s\n' "$*" | grep -q -- '--format'; then
+            if [ "${CUDO_FAKE_CONTAINER_RUNNING:-false}" = "true" ]; then
+                printf '%s\tUp 1 minute\n' "${CUDO_FAKE_CONTAINER_NAME:-cudo-container}"
+            fi
             exit 0
         fi
         echo "CONTAINER ID   IMAGE   COMMAND   CREATED   STATUS   PORTS   NAMES"
         ;;
-    stats|exec|inspect|images|rm|rmi|commit|run)
+    exec)
+        if printf '%s\n' "$*" | grep -q 'pgrep -x sshd' && [ "${CUDO_FAKE_SSHD_RUNNING:-false}" = "true" ]; then
+            exit 0
+        fi
+        ;;
+    stats|inspect|images|rm|rmi|commit|run)
         ;;
     *)
         ;;
@@ -221,6 +232,9 @@ syntax_checks() {
     bash -n "$SCRIPT_DIR/run_all_tests.sh"
     bash -n "$SCRIPT_DIR/test_fast.sh"
     python3 -m py_compile "$ROOT_DIR/scripts/cuda-env-list-simple.py"
+    if command -v shellcheck >/dev/null 2>&1; then
+        shellcheck "$CUDO" "$SCRIPT_DIR"/*.sh
+    fi
 }
 
 doctor_is_read_only_without_global_dir() {
@@ -336,8 +350,131 @@ doctor_reports_hashed_project_password() {
     cudo_fast doctor > "$output"
 
     assert_contains "$output" '^Cudo doctor$'
-    assert_contains "$output" 'SSH password is stored as a hash'
+    assert_contains "$output" 'SSH password is stored as a SHA-512 hash'
     assert_contains "$output" 'Doctor summary: 0 fail'
+}
+
+config_is_not_executed() {
+    local config_file="$PROJECT_DIR/.cudo/config"
+    local marker="$TMP_DIR/config-executed"
+
+    printf 'UNTRUSTED=$(touch %s)\n' "$marker" >> "$config_file"
+    cd "$PROJECT_DIR"
+    cudo_fast config > "$TMP_DIR/config-safe.out"
+    [ ! -e "$marker" ] || {
+        printf 'Configuration file was executed as shell code\n' >&2
+        return 1
+    }
+}
+
+secure_password_inputs_work() {
+    local config_file="$PROJECT_DIR/.cudo/config"
+    local password_file="$TMP_DIR/ssh-password"
+    printf '%s\n' 'stdin-secret' | (cd "$PROJECT_DIR" && cudo_fast start --ssh-port 2250 --ssh-password-stdin) > "$TMP_DIR/stdin-password.out"
+    assert_not_contains "$config_file" 'stdin-secret' || return 1
+
+    printf '%s\n' 'file-secret' > "$password_file"
+    cd "$PROJECT_DIR"
+    cudo_fast ssh passwd --ssh-password-file "$password_file" > "$TMP_DIR/file-password.out"
+    assert_not_contains "$config_file" 'file-secret'
+}
+
+ssh_lifecycle_commands_work() {
+    local config_file="$PROJECT_DIR/.cudo/config"
+    local container_name
+
+    cd "$PROJECT_DIR"
+    cudo_fast ssh status > "$TMP_DIR/ssh-status.out"
+    assert_contains "$TMP_DIR/ssh-status.out" '^SSH: enabled$' || return 1
+    container_name="cuda-project-$(config_value "$config_file" "UNIQUE_HASH")-container"
+    if CUDO_FAKE_CONTAINER_RUNNING=true CUDO_FAKE_CONTAINER_NAME="$container_name" CUDO_FAKE_SSHD_RUNNING=true \
+        cudo_fast ssh disable > "$TMP_DIR/ssh-disable-failed.out" 2>&1; then
+        printf 'SSH disable reported success while sshd was still running\n' >&2
+        return 1
+    fi
+    assert_contains "$config_file" '^SSH_ENABLED=true$' || return 1
+    assert_contains "$config_file" '^SSH_PASSWORD_HASH_B64=.+$' || return 1
+    cudo_fast ssh disable > "$TMP_DIR/ssh-disable.out"
+    assert_contains "$config_file" '^SSH_ENABLED=false$' || return 1
+    assert_contains "$config_file" '^SSH_PORT=$' || return 1
+    assert_not_contains "$config_file" '^SSH_PASSWORD_HASH_B64=' || return 1
+    cudo_fast ssh status > "$TMP_DIR/ssh-disabled-status.out"
+    assert_contains "$TMP_DIR/ssh-disabled-status.out" '^SSH: disabled$' || return 1
+    if cudo_fast ssh enable --port > "$TMP_DIR/ssh-missing-port.out" 2>&1; then
+        printf 'SSH enable accepted a missing port value\n' >&2
+        return 1
+    fi
+}
+
+gpu_selection_is_persisted() {
+    local config_file="$PROJECT_DIR/.cudo/config"
+    local compose_file="$PROJECT_DIR/.cudo/docker-compose.yml"
+
+    cd "$PROJECT_DIR"
+    cudo_fast start --gpus 0,1 > "$TMP_DIR/gpus.out"
+    assert_contains "$config_file" '^GPUS=0,1$' || return 1
+    assert_contains "$compose_file" 'NVIDIA_VISIBLE_DEVICES=0,1' || return 1
+    if cudo_fast start --gpus bad > "$TMP_DIR/gpus-invalid.out" 2>&1; then
+        printf 'Invalid GPU selection was accepted\n' >&2
+        return 1
+    fi
+}
+
+doctor_json_and_all_work() {
+    local config_file="$PROJECT_DIR/.cudo/config"
+    local global_config
+    global_config=$(global_config_for_hash "$config_file")
+    set_config_value "$global_config" "ENV_NAME" $'fast\tjson'
+    cd "$PROJECT_DIR"
+    cudo_fast doctor --all --json > "$TMP_DIR/doctor.json"
+    python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert "checks" in d and isinstance(d["checks"], list)' "$TMP_DIR/doctor.json"
+    set_config_value "$global_config" "ENV_NAME" "fast"
+}
+
+failed_start_rolls_back_ssh_config() {
+    local config_file="$PROJECT_DIR/.cudo/config"
+
+    cd "$PROJECT_DIR"
+    if CUDO_FAKE_COMPOSE_FAIL=true cudo_fast start --gpus all --ssh-port 2260 --ssh-password-file "$TMP_DIR/ssh-password" > "$TMP_DIR/start-failed.out" 2>&1; then
+        printf 'Expected container startup to fail\n' >&2
+        return 1
+    fi
+    assert_contains "$config_file" '^SSH_ENABLED=false$' || return 1
+    assert_contains "$config_file" '^SSH_PORT=$' || return 1
+    assert_not_contains "$config_file" '^SSH_PASSWORD_HASH_B64=' || return 1
+    assert_contains "$config_file" '^GPUS=0,1$'
+}
+
+invalid_config_is_rejected() {
+    local config_file="$PROJECT_DIR/.cudo/config"
+    set_config_value "$config_file" "SSH_PORT" "invalid"
+    cd "$PROJECT_DIR"
+    if cudo_fast config > "$TMP_DIR/invalid-config.out" 2>&1; then
+        printf 'Invalid configuration was accepted\n' >&2
+        return 1
+    fi
+    set_config_value "$config_file" "SSH_PORT" ""
+}
+
+legacy_rollback_restores_global_password() {
+    local config_file="$LEGACY_PROJECT_DIR/.cudo/config"
+    local global_config
+    local legacy_b64
+
+    legacy_b64=$(encode_b64 "rollback-legacy")
+    global_config=$(global_config_for_hash "$config_file")
+    set_config_value "$config_file" "SSH_PASSWORD_HASH_B64" ""
+    set_config_value "$config_file" "SSH_PASSWORD_B64" "$legacy_b64"
+    set_config_value "$global_config" "SSH_PASSWORD_HASH_B64" ""
+    set_config_value "$global_config" "SSH_PASSWORD_B64" "$legacy_b64"
+    cd "$LEGACY_PROJECT_DIR"
+    if CUDO_FAKE_COMPOSE_FAIL=true cudo_fast start --ssh-port 2261 > "$TMP_DIR/legacy-rollback.out" 2>&1; then
+        printf 'Expected legacy startup to fail\n' >&2
+        return 1
+    fi
+    assert_contains "$config_file" "^SSH_PASSWORD_B64=${legacy_b64}$" || return 1
+    assert_contains "$global_config" "^SSH_PASSWORD_B64=${legacy_b64}$" || return 1
+    assert_not_contains "$global_config" '^SSH_PASSWORD_HASH_B64=.+$'
 }
 
 main() {
@@ -351,6 +488,14 @@ main() {
     test_case "list shows configured SSH port" list_shows_configured_ssh_port
     test_case "legacy SSH_PASSWORD_B64 migrates to hash" legacy_password_b64_migrates_to_hash
     test_case "doctor reports hashed SSH password" doctor_reports_hashed_project_password
+    test_case "configuration files are parsed, not executed" config_is_not_executed
+    test_case "secure SSH password inputs work" secure_password_inputs_work
+    test_case "SSH lifecycle commands work" ssh_lifecycle_commands_work
+    test_case "GPU selection is persisted" gpu_selection_is_persisted
+    test_case "doctor supports all environments and JSON" doctor_json_and_all_work
+    test_case "failed startup rolls back SSH configuration" failed_start_rolls_back_ssh_config
+    test_case "invalid configuration is rejected" invalid_config_is_rejected
+    test_case "legacy rollback restores global password" legacy_rollback_restores_global_password
 
     printf '\nFast test summary: %s passed, %s failed\n' "$PASS_COUNT" "$FAIL_COUNT"
     [ "$FAIL_COUNT" -eq 0 ]

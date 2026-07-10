@@ -14,6 +14,7 @@ cd cudo
 
 # Test the installation
 cudo --help
+cudo doctor
 ```
 
 ## File Structure After Installation
@@ -75,6 +76,9 @@ cudo --help
 
 # Test list command (should show empty list or existing environments)
 cudo list
+
+# Diagnose Docker, NVIDIA runtime, Compose, and required host tools
+cudo doctor
 ```
 
 ## Dependencies
@@ -82,9 +86,28 @@ cudo list
 Make sure you have the following dependencies installed:
 
 - **Docker**: Container runtime
-- **Docker Compose**: Container orchestration
+- **Docker Compose v2 or v1**: Container orchestration
+- **NVIDIA Container Runtime**: GPU access from Docker containers
 - **Python 3**: For the list command
+- **gettext (`envsubst`)**: Configuration template rendering
+- **OpenSSL with `passwd -6`**: SSH password hashing
 - **Git**: For cloning the repository
+
+On Ubuntu or Debian, the host-side utility dependencies can be installed with:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y docker.io docker-compose-plugin python3 gettext openssl git
+```
+
+Install and configure the NVIDIA Container Toolkit separately using NVIDIA's instructions, then restart Docker. Verify that Docker exposes the runtime before building an environment:
+
+```bash
+docker info --format '{{json .Runtimes}}'
+cudo doctor
+```
+
+`cudo doctor` returns a non-zero exit code when a required check fails. Warnings, such as an environment that has not created its container yet, do not make the command fail.
 
 ## Uninstallation
 

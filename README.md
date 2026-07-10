@@ -15,7 +15,9 @@ A powerful command-line tool for managing CUDA development environments using Do
 - **Conflict Resolution**: Smart handling of projects with identical names
 - **Multi-Project Support**: Manage multiple CUDA projects simultaneously
 - **Docker Integration**: Seamless integration with Docker and Docker Compose
-- **Customizable**: Flexible configuration for CUDA versions, Python versions, and more
+- **Runtime SSH Access**: Password-authenticated SSH with no default listening port
+- **GPU Selection**: Select all, no, or specific GPUs when starting an environment
+- **Diagnostics and CI**: Built-in health checks plus automated fast tests
 
 ## 💡 Why Cudo?
 
@@ -59,6 +61,8 @@ cudo run
 - **Docker Compose** - Multi-container application management
 - **NVIDIA Docker Runtime** - GPU access in containers
 - **Python 3.6+** - For resource monitoring scripts
+- **gettext (`envsubst`)** - Configuration template rendering
+- **OpenSSL** - SHA-512 SSH password hashing
 
 
 ## 🛠️ Installation
@@ -122,22 +126,13 @@ cudo build -i my-custom-image
 cudo build --name train
 ```
 
-### Run and Enter Commands
+### Container Commands
 ```bash
 # Start and enter container
 cudo run
 
-# Start SSH on host port 2222 with password login
-cudo run --ssh-port 2222 --ssh-password my-password
-
-# Reuse the saved SSH password and change only the port
-cudo start --ssh-port 2223
-
 # Enter a named Cudo environment from any directory
 cudo enter train
-
-# Enter and update SSH settings for that environment
-cudo enter train --ssh-port 2224 --ssh-password my-password
 
 # Select an environment interactively
 cudo enter
@@ -153,6 +148,12 @@ cudo status
 
 # Start container
 cudo start
+
+# Start with selected GPUs; the selection is saved for later starts
+cudo start --gpus 0,1
+
+# Hide every GPU from the container
+cudo start --gpus none
 
 # Stop container
 cudo stop
@@ -170,9 +171,51 @@ cudo logs
 cudo remove
 ```
 
-Cudo images always include SSH support. SSH starts only after a port and password are configured with `run`, `start`, or `enter`. If the requested port is already in use, Cudo prompts for another port in interactive terminals.
+`--gpus` accepts `all`, `none`, or comma-separated numeric device IDs such as `0,1`. It is supported by `run`, `start`, and `enter`. Changing it for a running environment recreates the container with the new visibility setting while preserving the project volume.
 
-The SSH password is stored as a SHA-512 password hash in the Cudo config. Cudo does not configure a default SSH port.
+### SSH Commands
+
+Every image built by Cudo contains the SSH server packages, but SSH is disabled until both a port and password are explicitly configured. There is no default SSH port.
+
+```bash
+# Enable SSH for the current project; the password is prompted without echo
+cudo ssh enable --port 2222
+
+# Show saved settings and whether sshd is currently listening
+cudo ssh status
+
+# Rotate the password using a hidden interactive prompt
+cudo ssh passwd
+
+# Disable SSH, stop sshd, and remove the saved password hash and port
+cudo ssh disable
+
+# Connect from another machine
+ssh -p 2222 "$USER"@HOST
+```
+
+The existing runtime options remain available for `run`, `start`, and `enter`:
+
+```bash
+# Configure SSH while starting the current project
+cudo start --ssh-port 2222
+
+# Change the port of a named environment and enter it
+cudo enter train --ssh-port 2223
+
+# Read a password from standard input for automation
+printf '%s\n' "$CUDO_SSH_PASSWORD" | \
+  cudo run --ssh-port 2222 --ssh-password-stdin
+
+# Read only the first line of a password file
+cudo start --ssh-port 2222 --ssh-password-file /run/secrets/cudo-ssh
+```
+
+If no password has been saved, an interactive command prompts for one. Non-interactive commands must use `--ssh-password-stdin` or `--ssh-password-file`. The legacy `--ssh-password VALUE` option remains compatible, but it exposes the secret in shell history and process arguments and should not be used in new scripts.
+
+Passwords are stored only as salted SHA-512 crypt hashes. Existing `SSH_PASSWORD_B64` configurations are migrated when SSH is next configured. Cudo validates the requested host port before startup; if it is occupied in an interactive terminal, Cudo asks for another. Startup and SSH configuration failures restore the previous SSH and GPU settings.
+
+SSH uses the current host username inside the container. Password authentication is enabled only for that non-root user; root login, empty passwords, and public-key authentication are disabled by the generated Cudo SSH configuration.
 
 ### List Command
 ```bash
@@ -198,22 +241,51 @@ This command removes project configurations that are marked as deleted in the gl
 ```bash
 # Diagnose dependencies and the current project configuration
 cudo doctor
+
+# Check every registered environment
+cudo doctor --all
+
+# Machine-readable output for automation
+cudo doctor --all --json
 ```
 
 This command only reports `PASS`, `WARN`, and `FAIL` checks. It does not modify your environment.
 
-## 🔧 Configuration Options
+`doctor` checks Docker, Compose, the NVIDIA runtime, required host tools, global configuration access, the current image and container, SSH configuration, SSH runtime state, and GPU selection. `--all` also checks every environment in the global registry. `--json` returns an object with `failures`, `warnings`, and `checks`; the command exits non-zero when any `FAIL` check is present.
+
+## 🔧 Command Options
+
+### Build Options
 
 | Option | Description | Default |
-|--------|-------------|---------|
+|---|---|---|
 | `-c, --cuda-version` | CUDA version | 12.4.0 |
 | `-u, --ubuntu-version` | Ubuntu version | 20.04 |
 | `-t, --with-toolkit` | Include CUDA Toolkit | false |
 | `-p, --python-version` | Python version | 3.10 |
 | `-i, --image-name` | Custom image name | auto-generated |
 | `-n, --name` | Environment name for `cudo enter` | project directory name |
+
+### Runtime Options
+
+These options apply to `run`, `start`, and `enter`.
+
+| Option | Description | Default |
+|---|---|---|
 | `--ssh-port` | Runtime SSH port for `run`, `start`, or `enter` | unset |
-| `--ssh-password` | Runtime SSH password for `run`, `start`, or `enter` | unset |
+| `--ssh-password-stdin` | Read the SSH password from standard input | unset |
+| `--ssh-password-file FILE` | Read the first line of a password file | unset |
+| `--ssh-password VALUE` | Deprecated plaintext argument | unset |
+| `--gpus` | Visible GPUs: `all`, `none`, or device IDs such as `0,1` | all |
+
+### SSH Subcommands
+
+| Command | Effect |
+|---|---|
+| `cudo ssh enable --port PORT` | Save SSH settings and start the container |
+| `cudo ssh status` | Show configuration and runtime listening state |
+| `cudo ssh passwd` | Replace the saved password hash |
+| `cudo ssh disable` | Stop sshd and remove SSH runtime settings |
 
 ## 📊 Example Output
 
@@ -235,6 +307,7 @@ Statistics:
 .cudo/                       # Docker configuration for project
 ├── Dockerfile               # Generated Dockerfile with CUDA support
 ├── docker-compose.yml       # Docker Compose configuration
+├── cudo-entrypoint.sh       # Container startup and SSH configuration
 └── config                   # Project settings
 
 /var/lib/cudo-global/        # Global configuration (multi-user support)
@@ -246,10 +319,11 @@ Statistics:
 1. **Docker Image Building**: Generates optimized Dockerfile with CUDA support
 2. **Container Orchestration**: Uses Docker Compose for lifecycle management
 3. **Volume Mounting**: Maps project directories into containers
-4. **GPU Access**: Configures NVIDIA runtime for GPU acceleration
+4. **GPU Access**: Persists GPU visibility and configures the NVIDIA runtime
 5. **Global Tracking**: Stores project metadata in `/var/lib/cudo-global/`
 6. **Resource Monitoring**: Integrates with Docker stats and NVIDIA tools
-7. **Runtime SSH Access**: Starts `sshd` with password authentication after a port and password are configured
+7. **Runtime SSH Access**: Starts `sshd` only after an explicit port and password are configured
+8. **Safe Configuration Loading**: Parses and validates known fields without executing the config as shell code
 
 ## 🐛 Troubleshooting
 
@@ -284,6 +358,31 @@ sudo usermod -aG docker $USER
 # This happens when the Docker image was deleted but the project still exists
 # Simply rebuild the environment:
 cudo build
+```
+
+**SSH does not start**
+```bash
+# Check the saved port, hash format, entrypoint, and running sshd process
+cudo doctor
+cudo ssh status
+
+# Reconfigure SSH interactively
+cudo ssh disable
+cudo ssh enable --port 2222
+```
+
+**SSH port is already occupied**
+```bash
+# Pick an available port; interactive commands will also prompt for another
+cudo start --ssh-port 2223
+```
+
+**Use only selected GPUs**
+```bash
+cudo start --gpus 0,1
+
+# Confirm the saved selection and NVIDIA runtime
+cudo doctor
 ```
 
 **Too many deleted projects in list**

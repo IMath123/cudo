@@ -32,6 +32,12 @@ The default suite checks:
 - SSH password hash storage with `SSH_PASSWORD_HASH_B64`
 - migration from legacy `SSH_PASSWORD_B64`
 - dynamic SSH port updates through `run`, `start`, and `enter`
+- secure password input through standard input and files
+- SSH enable/status/password/disable lifecycle
+- safe config parsing without shell execution
+- GPU selection persistence
+- startup failure rollback
+- `doctor --all --json`
 - `cudo list` SSH column output
 
 Fast test requirements:
@@ -42,6 +48,19 @@ Fast test requirements:
 - `base64`
 
 Fast tests do not require Docker, Docker Compose, NVIDIA runtime, or access to `/var/lib/cudo-global`.
+
+## Continuous Integration
+
+GitHub Actions runs ShellCheck and the fast suite on every push and pull request. A manual `workflow_dispatch` run also exposes the integration job on a self-hosted runner carrying the `linux` and `gpu` labels.
+
+The CI-equivalent local checks are:
+
+```bash
+shellcheck --severity=error cudo tests/*.sh
+./tests/run_all_tests.sh
+```
+
+The integration job is intentionally separate because it requires a working Docker daemon, NVIDIA runtime, GPU, and suitable CUDA driver.
 
 ## Integration Tests
 

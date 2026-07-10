@@ -14,6 +14,7 @@ DEFAULT_UBUNTU_VERSION="20.04"
 DEFAULT_WITH_TOOLKIT="false"
 DEFAULT_PYTHON_VERSION="3.10"
 DEFAULT_SSH_ENABLED="true"
+DEFAULT_GPUS="all"
 # 注意：实际的镜像名称会在 build 时加上 UNIQUE_HASH
 DEFAULT_IMAGE_NAME_BASE="cuda-project-$(basename "$PROJECT_ROOT" | tr '[:upper:]' '[:lower:]')"
 
@@ -40,6 +41,58 @@ read_config_value() {
     local config_file=$1
     local key=$2
     grep -m1 "^${key}=" "$config_file" 2>/dev/null | cut -d'=' -f2- | sed 's/^"//; s/"$//'
+}
+
+load_config_values() {
+    local config_file=$1
+
+    CUDA_VERSION=$(read_config_value "$config_file" "CUDA_VERSION")
+    UBUNTU_VERSION=$(read_config_value "$config_file" "UBUNTU_VERSION")
+    WITH_TOOLKIT=$(read_config_value "$config_file" "WITH_TOOLKIT")
+    PYTHON_VERSION=$(read_config_value "$config_file" "PYTHON_VERSION")
+    IMAGE_NAME=$(read_config_value "$config_file" "IMAGE_NAME")
+    CUDA_VARIANT=$(read_config_value "$config_file" "CUDA_VARIANT")
+    UNIQUE_HASH=$(read_config_value "$config_file" "UNIQUE_HASH")
+    ENV_NAME=$(read_config_value "$config_file" "ENV_NAME")
+    GPUS=$(read_config_value "$config_file" "GPUS")
+    SSH_ENABLED=$(read_config_value "$config_file" "SSH_ENABLED")
+    SSH_PORT=$(read_config_value "$config_file" "SSH_PORT")
+    SSH_USER=$(read_config_value "$config_file" "SSH_USER")
+    SSH_PASSWORD_HASH_B64=$(read_config_value "$config_file" "SSH_PASSWORD_HASH_B64")
+    SSH_PASSWORD_B64=$(read_config_value "$config_file" "SSH_PASSWORD_B64")
+}
+
+validate_loaded_config() {
+    if [ -z "$UNIQUE_HASH" ] || [[ ! "$UNIQUE_HASH" =~ ^[a-f0-9]{8}$ ]]; then
+        log_error "Configuration file contains invalid UNIQUE_HASH: ${UNIQUE_HASH:-<empty>}"
+        return 1
+    fi
+    if ! validate_image_name "$IMAGE_NAME" >/dev/null 2>&1; then
+        log_error "Configuration file contains invalid IMAGE_NAME: ${IMAGE_NAME:-<empty>}"
+        return 1
+    fi
+    if [ -n "$ENV_NAME" ] && ! validate_env_name "$ENV_NAME" >/dev/null 2>&1; then
+        log_error "Configuration file contains invalid ENV_NAME: $ENV_NAME"
+        return 1
+    fi
+    if [ -n "$SSH_PORT" ] && ! validate_ssh_port "$SSH_PORT" >/dev/null 2>&1; then
+        log_error "Configuration file contains invalid SSH_PORT: $SSH_PORT"
+        return 1
+    fi
+    if [ -n "$SSH_USER" ] && [[ ! "$SSH_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+        log_error "Configuration file contains invalid SSH_USER: $SSH_USER"
+        return 1
+    fi
+    if [ -n "$SSH_PASSWORD_HASH_B64" ]; then
+        if ! validate_password_hash_b64 "$SSH_PASSWORD_HASH_B64"; then
+            log_error "Configuration file contains an invalid SSH password hash"
+            return 1
+        fi
+    fi
+    if ! validate_gpus "${GPUS:-$DEFAULT_GPUS}" >/dev/null 2>&1; then
+        log_error "Configuration file contains invalid GPUS: ${GPUS:-}"
+        return 1
+    fi
 }
 
 set_config_value() {
@@ -255,6 +308,7 @@ IMAGE_NAME=$IMAGE_NAME
 CUDA_VARIANT=$CUDA_VARIANT
 UNIQUE_HASH=$UNIQUE_HASH
 ENV_NAME=$ENV_NAME
+GPUS=$GPUS
 SSH_ENABLED=$SSH_ENABLED
 SSH_PORT=$SSH_PORT
 SSH_USER=$SSH_USER
@@ -370,6 +424,7 @@ WITH_TOOLKIT=$WITH_TOOLKIT
 PYTHON_VERSION=$PYTHON_VERSION
 IMAGE_NAME=$IMAGE_NAME
 CUDA_VARIANT=$CUDA_VARIANT
+GPUS=$GPUS
 SSH_ENABLED=$SSH_ENABLED
 SSH_PORT=$SSH_PORT
 SSH_USER=$SSH_USER
@@ -478,17 +533,14 @@ cleanup_old_global_configs() {
 # 加载配置
 load_config() {
     if [ -f "$CONFIG_FILE" ]; then
-        source "$CONFIG_FILE"
-        # 如果配置中没有 UNIQUE_HASH，这是一个错误状态
-        if [ -z "$UNIQUE_HASH" ]; then
-            log_error "Configuration file is missing UNIQUE_HASH. Please rebuild the project."
-            return 1
-        fi
+        load_config_values "$CONFIG_FILE"
         SSH_ENABLED=${SSH_ENABLED:-$DEFAULT_SSH_ENABLED}
         SSH_PORT=${SSH_PORT:-}
         SSH_USER=${SSH_USER:-$(id -un)}
         SSH_PASSWORD_HASH_B64=${SSH_PASSWORD_HASH_B64:-}
         SSH_PASSWORD_B64=${SSH_PASSWORD_B64:-}
+        GPUS=${GPUS:-$DEFAULT_GPUS}
+        validate_loaded_config || return 1
         ensure_env_name
         return 0
     else
@@ -574,6 +626,18 @@ validate_ssh_port() {
     return 0
 }
 
+validate_gpus() {
+    local gpus=$1
+
+    if [[ "$gpus" =~ ^(all|none|[0-9]+(,[0-9]+)*)$ ]]; then
+        return 0
+    fi
+
+    log_error "Invalid GPU selection: '$gpus'"
+    log_error "Use 'all', 'none', or a comma-separated device list such as '0,1'"
+    return 1
+}
+
 ssh_port_in_use() {
     local port=$1
 
@@ -630,6 +694,12 @@ base64_decode_value() {
     fi
 }
 
+validate_password_hash_b64() {
+    local decoded_hash=""
+    decoded_hash=$(base64_decode_value "$1" 2>/dev/null || true)
+    [[ "$decoded_hash" =~ ^\$6\$[^\$]{1,16}\$[./A-Za-z0-9]{20,}$ ]]
+}
+
 generate_ssh_password_hash_b64() {
     local password=$1
     local salt
@@ -671,7 +741,7 @@ read_ssh_password() {
     local password
 
     if [ ! -t 0 ]; then
-        log_error "SSH password is required. Pass --ssh-password <password> in non-interactive mode."
+        log_error "SSH password is required. Use --ssh-password-stdin or --ssh-password-file in non-interactive mode."
         return 1
     fi
 
@@ -685,6 +755,28 @@ read_ssh_password() {
 
     SSH_INPUT_PASSWORD="$password"
     return 0
+}
+
+read_ssh_password_file() {
+    local password_file=$1
+
+    if [ ! -r "$password_file" ]; then
+        log_error "SSH password file is not readable: $password_file"
+        return 1
+    fi
+    IFS= read -r SSH_INPUT_PASSWORD < "$password_file" || true
+    if [ -z "$SSH_INPUT_PASSWORD" ]; then
+        log_error "SSH password file is empty: $password_file"
+        return 1
+    fi
+}
+
+read_ssh_password_stdin() {
+    IFS= read -r SSH_INPUT_PASSWORD || true
+    if [ -z "$SSH_INPUT_PASSWORD" ]; then
+        log_error "No SSH password was received on standard input"
+        return 1
+    fi
 }
 
 resolve_ssh_port_for_start() {
@@ -739,6 +831,7 @@ write_docker_compose_file() {
 
     local service_name="cuda-project-${unique_hash}"
     local container_name="${service_name}-container"
+    local selected_gpus="${GPUS:-$DEFAULT_GPUS}"
 
     cat > "$compose_file" << EOF
 services:
@@ -751,7 +844,7 @@ services:
     container_name: ${container_name}
     runtime: nvidia
     environment:
-      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_VISIBLE_DEVICES=${selected_gpus}
       - NVIDIA_DRIVER_CAPABILITIES=all
     volumes:
       - ..:/workspace
@@ -828,8 +921,13 @@ configure_cudo_ssh() {
     if [ -n "$CUDO_SSH_PASSWORD_HASH_B64" ]; then
         password_hash=$(decode_base64_value "$CUDO_SSH_PASSWORD_HASH_B64")
     else
-        echo "Legacy Cudo SSH password config requires 'cudo run/start/enter --ssh-password' to migrate." >&2
+        echo "Legacy Cudo SSH password config requires host-side migration with cudo run, start, or enter." >&2
         return 0
+    fi
+
+    if ! printf '%s' "$password_hash" | grep -Eq '^\$6\$[^$]{1,16}\$[./A-Za-z0-9]{20,}$'; then
+        echo "Invalid Cudo SSH password hash" >&2
+        exit 1
     fi
 
     sudo mkdir -p /run/sshd /etc/ssh/sshd_config.d
@@ -924,6 +1022,12 @@ update_ssh_runtime_config() {
         fi
     fi
 
+    SSH_PREVIOUS_ENABLED=$(read_config_value "$project_config_file" "SSH_ENABLED")
+    SSH_PREVIOUS_PORT="$current_port"
+    SSH_PREVIOUS_USER="$current_user"
+    SSH_PREVIOUS_PASSWORD_HASH_B64="$current_password_hash_b64"
+    SSH_PREVIOUS_PASSWORD_B64="$current_password_b64"
+
     set_config_value "$project_config_file" "SSH_ENABLED" "true"
     set_config_value "$project_config_file" "SSH_PORT" "$port"
     set_config_value "$project_config_file" "SSH_USER" "$current_user"
@@ -953,8 +1057,116 @@ update_ssh_runtime_config() {
     log_info "SSH configured: user $current_user, port $port"
 }
 
+rollback_ssh_runtime_config() {
+    local project_path=$1
+    local image_name=$2
+    local unique_hash=$3
+    local config_file=$4
+
+    if [ "${SSH_RUNTIME_CONFIGURED:-false}" != "true" ]; then
+        rollback_gpu_runtime_config "$project_path" "$image_name" "$unique_hash" "$config_file"
+        return 0
+    fi
+
+    local project_config_file="$project_path/.cudo/config"
+    local global_config_file="$config_file"
+    set_config_value "$project_config_file" "SSH_ENABLED" "${SSH_PREVIOUS_ENABLED:-true}"
+    set_config_value "$project_config_file" "SSH_PORT" "${SSH_PREVIOUS_PORT:-}"
+    set_config_value "$project_config_file" "SSH_USER" "${SSH_PREVIOUS_USER:-$(id -un)}"
+    if [ -n "${SSH_PREVIOUS_PASSWORD_HASH_B64:-}" ]; then
+        set_config_value "$project_config_file" "SSH_PASSWORD_HASH_B64" "$SSH_PREVIOUS_PASSWORD_HASH_B64"
+    else
+        remove_config_value "$project_config_file" "SSH_PASSWORD_HASH_B64"
+    fi
+    if [ -n "${SSH_PREVIOUS_PASSWORD_B64:-}" ]; then
+        set_config_value "$project_config_file" "SSH_PASSWORD_B64" "$SSH_PREVIOUS_PASSWORD_B64"
+    else
+        remove_config_value "$project_config_file" "SSH_PASSWORD_B64"
+    fi
+    if [ "$global_config_file" = "$project_config_file" ]; then
+        global_config_file=$(get_global_config_for_hash "$unique_hash")
+    fi
+    if [ -n "$global_config_file" ] && [ -f "$global_config_file" ]; then
+        set_config_value "$global_config_file" "SSH_ENABLED" "${SSH_PREVIOUS_ENABLED:-true}"
+        set_config_value "$global_config_file" "SSH_PORT" "${SSH_PREVIOUS_PORT:-}"
+        set_config_value "$global_config_file" "SSH_USER" "${SSH_PREVIOUS_USER:-$(id -un)}"
+        if [ -n "${SSH_PREVIOUS_PASSWORD_HASH_B64:-}" ]; then
+            set_config_value "$global_config_file" "SSH_PASSWORD_HASH_B64" "$SSH_PREVIOUS_PASSWORD_HASH_B64"
+        else
+            remove_config_value "$global_config_file" "SSH_PASSWORD_HASH_B64"
+        fi
+        if [ -n "${SSH_PREVIOUS_PASSWORD_B64:-}" ]; then
+            set_config_value "$global_config_file" "SSH_PASSWORD_B64" "$SSH_PREVIOUS_PASSWORD_B64"
+        else
+            remove_config_value "$global_config_file" "SSH_PASSWORD_B64"
+        fi
+    fi
+    SSH_ENABLED="${SSH_PREVIOUS_ENABLED:-true}"
+    SSH_PORT="${SSH_PREVIOUS_PORT:-}"
+    SSH_USER="${SSH_PREVIOUS_USER:-$(id -un)}"
+    SSH_PASSWORD_HASH_B64="${SSH_PREVIOUS_PASSWORD_HASH_B64:-}"
+    SSH_PASSWORD_B64="${SSH_PREVIOUS_PASSWORD_B64:-}"
+    write_docker_compose_file "$project_path/.cudo/docker-compose.yml" "$image_name" "$unique_hash"
+    SSH_RUNTIME_CONFIGURED=false
+    rollback_gpu_runtime_config "$project_path" "$image_name" "$unique_hash" "$config_file"
+    log_warning "Restored the previous SSH configuration after startup failure"
+}
+
 container_has_ssh_config() {
     [ "${SSH_ENABLED:-false}" = "true" ] && [ -n "${SSH_PORT:-}" ] && [ -n "${SSH_PASSWORD_HASH_B64:-}" ]
+}
+
+update_gpu_runtime_config() {
+    local project_path=$1
+    local image_name=$2
+    local unique_hash=$3
+    local config_file=$4
+    local requested_gpus=$5
+
+    if [ -z "$requested_gpus" ]; then
+        return 0
+    fi
+
+    local project_config_file="$project_path/.cudo/config"
+    local global_config_file="$config_file"
+    GPU_PREVIOUS_VALUE=$(read_config_value "$project_config_file" "GPUS")
+    GPU_PREVIOUS_VALUE=${GPU_PREVIOUS_VALUE:-$DEFAULT_GPUS}
+    set_config_value "$project_config_file" "GPUS" "$requested_gpus"
+    if [ "$global_config_file" = "$project_config_file" ]; then
+        global_config_file=$(get_global_config_for_hash "$unique_hash")
+    fi
+    if [ -n "$global_config_file" ] && [ -f "$global_config_file" ]; then
+        set_config_value "$global_config_file" "GPUS" "$requested_gpus"
+    fi
+    GPUS="$requested_gpus"
+    write_docker_compose_file "$project_path/.cudo/docker-compose.yml" "$image_name" "$unique_hash"
+    GPU_RUNTIME_CONFIGURED=true
+    log_info "GPU selection configured: $requested_gpus"
+}
+
+rollback_gpu_runtime_config() {
+    local project_path=$1
+    local image_name=$2
+    local unique_hash=$3
+    local config_file=$4
+
+    if [ "${GPU_RUNTIME_CONFIGURED:-false}" != "true" ]; then
+        return 0
+    fi
+
+    local project_config_file="$project_path/.cudo/config"
+    local global_config_file="$config_file"
+    set_config_value "$project_config_file" "GPUS" "$GPU_PREVIOUS_VALUE"
+    if [ "$global_config_file" = "$project_config_file" ]; then
+        global_config_file=$(get_global_config_for_hash "$unique_hash")
+    fi
+    if [ -n "$global_config_file" ] && [ -f "$global_config_file" ]; then
+        set_config_value "$global_config_file" "GPUS" "$GPU_PREVIOUS_VALUE"
+    fi
+    GPUS="$GPU_PREVIOUS_VALUE"
+    write_docker_compose_file "$project_path/.cudo/docker-compose.yml" "$image_name" "$unique_hash"
+    GPU_RUNTIME_CONFIGURED=false
+    log_warning "Restored the previous GPU selection after startup failure"
 }
 
 configure_running_container_ssh() {
@@ -965,11 +1177,48 @@ configure_running_container_ssh() {
     fi
 
     if docker exec "$container_name" test -x /usr/local/bin/cudo-entrypoint >/dev/null 2>&1; then
-        docker exec "$container_name" /usr/local/bin/cudo-entrypoint true >/dev/null
+        if ! docker exec "$container_name" /usr/local/bin/cudo-entrypoint true >/dev/null; then
+            log_error "Failed to configure SSH in container $container_name"
+            docker exec "$container_name" sh -c 'tail -n 30 /var/log/cudo-sshd.log 2>/dev/null || true' >&2 || true
+            return 1
+        fi
         log_info "SSH is ready: ssh -p $SSH_PORT $SSH_USER@<host>"
     else
         log_warning "Container image does not include SSH support. Rebuild with: cudo build"
+        return 1
     fi
+}
+
+wait_for_container_ready() {
+    local container_name=$1
+    local attempts=${CUDO_READY_ATTEMPTS:-30}
+    local attempt=1
+
+    while [ "$attempt" -le "$attempts" ]; do
+        if docker exec "$container_name" true >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+        attempt=$((attempt + 1))
+    done
+
+    log_error "Container did not become ready: $container_name"
+    docker logs --tail 30 "$container_name" >&2 || true
+    return 1
+}
+
+start_container_ready() {
+    local config_dir=$1
+    local container_name=$2
+
+    if ! (cd "$config_dir" && docker_compose_cmd up -d); then
+        log_error "Failed to start container"
+        if [ -n "${SSH_PORT:-}" ] && ssh_port_in_use "$SSH_PORT"; then
+            log_error "SSH port $SSH_PORT became occupied before the container started"
+        fi
+        return 1
+    fi
+    wait_for_container_ready "$container_name"
 }
 
 # 生成 Dockerfile
@@ -1303,16 +1552,23 @@ build_command() {
     local existing_ssh_user=""
     local existing_ssh_password_hash_b64=""
     local existing_ssh_password_b64=""
+    local existing_gpus="$DEFAULT_GPUS"
     if [ -f "$CONFIG_FILE" ]; then
-        ENV_NAME=""
-        UNIQUE_HASH=""
-        source "$CONFIG_FILE"
+        load_config_values "$CONFIG_FILE"
+        GPUS=${GPUS:-$DEFAULT_GPUS}
+        SSH_ENABLED=${SSH_ENABLED:-$DEFAULT_SSH_ENABLED}
+        SSH_USER=${SSH_USER:-$(id -un)}
+        SSH_PORT=${SSH_PORT:-}
+        SSH_PASSWORD_HASH_B64=${SSH_PASSWORD_HASH_B64:-}
+        SSH_PASSWORD_B64=${SSH_PASSWORD_B64:-}
+        validate_loaded_config || exit 1
         existing_hash="$UNIQUE_HASH"
         existing_env_name="$ENV_NAME"
         existing_ssh_port="${SSH_PORT:-}"
         existing_ssh_user="${SSH_USER:-}"
         existing_ssh_password_hash_b64="${SSH_PASSWORD_HASH_B64:-}"
         existing_ssh_password_b64="${SSH_PASSWORD_B64:-}"
+        existing_gpus="${GPUS:-$DEFAULT_GPUS}"
     fi
 
     # 解析构建参数
@@ -1437,6 +1693,7 @@ build_command() {
     SSH_USER=${existing_ssh_user:-$(id -un)}
     SSH_PASSWORD_HASH_B64=$existing_ssh_password_hash_b64
     SSH_PASSWORD_B64=$existing_ssh_password_b64
+    GPUS=$existing_gpus
     if [ -z "$SSH_PASSWORD_HASH_B64" ] && [ -n "$SSH_PASSWORD_B64" ]; then
         if SSH_PASSWORD_HASH_B64=$(password_hash_from_legacy_b64 "$SSH_PASSWORD_B64"); then
             SSH_PASSWORD_B64=""
@@ -1457,6 +1714,7 @@ build_command() {
     echo "  Project path: $PROJECT_ROOT"
     echo "  Unique hash: $UNIQUE_HASH"
     echo "  SSH support: enabled"
+    echo "  GPUs: $GPUS"
     if [ -n "$SSH_PORT" ] && [ -n "$SSH_PASSWORD_HASH_B64" ]; then
         echo "  SSH runtime: configured (user: $SSH_USER, port: $SSH_PORT)"
     else
@@ -1490,7 +1748,7 @@ build_command() {
         log_info "SSH will start with the container."
         log_info "Connect with: ssh -p $SSH_PORT $SSH_USER@<host>"
     else
-        log_info "SSH support is included. Configure it with: cudo run --ssh-port <port> --ssh-password <password>"
+        log_info "SSH support is included. Configure it with: cudo ssh enable --port <port>"
     fi
 }
 
@@ -1498,6 +1756,9 @@ parse_ssh_runtime_options() {
     SSH_OPTION_PORT=""
     SSH_OPTION_PASSWORD=""
     SSH_OPTION_PASSWORD_PROVIDED=false
+    SSH_OPTION_PASSWORD_FILE=""
+    SSH_OPTION_PASSWORD_STDIN=false
+    GPU_OPTION=""
     RUNTIME_REMAINING_ARGS=()
 
     while [[ $# -gt 0 ]]; do
@@ -1520,6 +1781,26 @@ parse_ssh_runtime_options() {
                 fi
                 SSH_OPTION_PASSWORD="$2"
                 SSH_OPTION_PASSWORD_PROVIDED=true
+                log_warning "--ssh-password exposes the secret in process arguments; prefer an interactive prompt, --ssh-password-stdin, or --ssh-password-file"
+                shift 2
+                ;;
+            --ssh-password-file)
+                if [ $# -lt 2 ]; then
+                    log_error "Missing value for --ssh-password-file"
+                    exit 1
+                fi
+                SSH_OPTION_PASSWORD_FILE="$2"
+                shift 2
+                ;;
+            --ssh-password-stdin)
+                SSH_OPTION_PASSWORD_STDIN=true
+                shift
+                ;;
+            --gpus)
+                if [ $# -lt 2 ] || ! validate_gpus "$2"; then
+                    exit 1
+                fi
+                GPU_OPTION="$2"
                 shift 2
                 ;;
             *)
@@ -1528,11 +1809,31 @@ parse_ssh_runtime_options() {
                 ;;
         esac
     done
+
+
+    local password_sources=0
+    [ "$SSH_OPTION_PASSWORD_PROVIDED" = "true" ] && password_sources=$((password_sources + 1))
+    [ -n "$SSH_OPTION_PASSWORD_FILE" ] && password_sources=$((password_sources + 1))
+    [ "$SSH_OPTION_PASSWORD_STDIN" = "true" ] && password_sources=$((password_sources + 1))
+    if [ "$password_sources" -gt 1 ]; then
+        log_error "Use only one SSH password input method"
+        exit 1
+    fi
+    if [ -n "$SSH_OPTION_PASSWORD_FILE" ]; then
+        read_ssh_password_file "$SSH_OPTION_PASSWORD_FILE" || exit 1
+        SSH_OPTION_PASSWORD="$SSH_INPUT_PASSWORD"
+        SSH_OPTION_PASSWORD_PROVIDED=true
+    elif [ "$SSH_OPTION_PASSWORD_STDIN" = "true" ]; then
+        read_ssh_password_stdin || exit 1
+        SSH_OPTION_PASSWORD="$SSH_INPUT_PASSWORD"
+        SSH_OPTION_PASSWORD_PROVIDED=true
+    fi
 }
 
 # 运行命令（进入容器）
 run_command() {
     parse_ssh_runtime_options "$@"
+    GPU_RUNTIME_CONFIGURED=false
     if [ ${#RUNTIME_REMAINING_ARGS[@]} -gt 0 ]; then
         log_error "Unexpected argument: ${RUNTIME_REMAINING_ARGS[0]}"
         usage
@@ -1570,6 +1871,7 @@ run_command() {
 
     local status=$(check_container_status "$IMAGE_NAME")
     local container_name="cuda-project-${UNIQUE_HASH}-container"
+    update_gpu_runtime_config "$PROJECT_ROOT" "$IMAGE_NAME" "$UNIQUE_HASH" "$CONFIG_FILE" "$GPU_OPTION"
     local check_ssh_port=true
     if [ "$status" = "running" ] && [ -z "$SSH_OPTION_PORT" ]; then
         check_ssh_port=false
@@ -1577,29 +1879,37 @@ run_command() {
 
     SSH_RUNTIME_CONFIGURED=false
     if ! update_ssh_runtime_config "$PROJECT_ROOT" "$IMAGE_NAME" "$UNIQUE_HASH" "$CONFIG_FILE" "$SSH_OPTION_PORT" "$SSH_OPTION_PASSWORD" "$SSH_OPTION_PASSWORD_PROVIDED" "$check_ssh_port"; then
+        rollback_gpu_runtime_config "$PROJECT_ROOT" "$IMAGE_NAME" "$UNIQUE_HASH" "$CONFIG_FILE"
         exit 1
     fi
 
     case $status in
         "running")
             log_info "Entering container..."
-            configure_running_container_ssh "$container_name"
+            if [ -n "$GPU_OPTION" ] && ! start_container_ready "$CONFIG_DIR" "$container_name"; then
+                rollback_ssh_runtime_config "$PROJECT_ROOT" "$IMAGE_NAME" "$UNIQUE_HASH" "$CONFIG_FILE"
+                exit 1
+            fi
+            if ! configure_running_container_ssh "$container_name"; then
+                rollback_ssh_runtime_config "$PROJECT_ROOT" "$IMAGE_NAME" "$UNIQUE_HASH" "$CONFIG_FILE"
+                exit 1
+            fi
             docker exec -it "$container_name" bash
             ;;
         "stopped")
             log_info "Starting container and entering..."
-            cd "$CONFIG_DIR"
-            docker_compose_cmd up -d
-            sleep 2
-            configure_running_container_ssh "$container_name"
+            if ! start_container_ready "$CONFIG_DIR" "$container_name" || ! configure_running_container_ssh "$container_name"; then
+                rollback_ssh_runtime_config "$PROJECT_ROOT" "$IMAGE_NAME" "$UNIQUE_HASH" "$CONFIG_FILE"
+                exit 1
+            fi
             docker exec -it "$container_name" bash
             ;;
         "nonexistent")
             log_info "Creating and starting container..."
-            cd "$CONFIG_DIR"
-            docker_compose_cmd up -d
-            sleep 2
-            configure_running_container_ssh "$container_name"
+            if ! start_container_ready "$CONFIG_DIR" "$container_name" || ! configure_running_container_ssh "$container_name"; then
+                rollback_ssh_runtime_config "$PROJECT_ROOT" "$IMAGE_NAME" "$UNIQUE_HASH" "$CONFIG_FILE"
+                exit 1
+            fi
             docker exec -it "$container_name" bash
             ;;
     esac
@@ -1641,9 +1951,127 @@ status_command() {
     fi
 }
 
+disable_ssh_config() {
+    local global_config_file
+
+    set_config_value "$CONFIG_FILE" "SSH_ENABLED" "false"
+    set_config_value "$CONFIG_FILE" "SSH_PORT" ""
+    remove_config_value "$CONFIG_FILE" "SSH_PASSWORD_HASH_B64"
+    remove_config_value "$CONFIG_FILE" "SSH_PASSWORD_B64"
+    global_config_file=$(get_global_config_for_hash "$UNIQUE_HASH")
+    if [ -n "$global_config_file" ] && [ -f "$global_config_file" ]; then
+        set_config_value "$global_config_file" "SSH_ENABLED" "false"
+        set_config_value "$global_config_file" "SSH_PORT" ""
+        remove_config_value "$global_config_file" "SSH_PASSWORD_HASH_B64"
+        remove_config_value "$global_config_file" "SSH_PASSWORD_B64"
+    fi
+    SSH_ENABLED=false
+    SSH_PORT=""
+    SSH_PASSWORD_HASH_B64=""
+    SSH_PASSWORD_B64=""
+    write_docker_compose_file "$DOCKER_COMPOSE_FILE" "$IMAGE_NAME" "$UNIQUE_HASH"
+}
+
+ssh_command() {
+    local action=${1:-status}
+    shift || true
+
+    case "$action" in
+        enable)
+            local args=()
+            while [ $# -gt 0 ]; do
+                if [ "$1" = "--port" ]; then
+                    if [ $# -lt 2 ]; then
+                        log_error "Missing value for --port"
+                        exit 1
+                    fi
+                    args+=("--ssh-port" "$2")
+                    shift 2
+                else
+                    args+=("$1")
+                    shift
+                fi
+            done
+            start_command "${args[@]}"
+            ;;
+        status)
+            if [ $# -gt 0 ]; then
+                log_error "Usage: cudo ssh status"
+                exit 1
+            fi
+            load_config || { log_error "Configuration file not found, please run cudo build first"; exit 1; }
+            if container_has_ssh_config; then
+                echo "SSH: enabled"
+                echo "User: $SSH_USER"
+                echo "Port: $SSH_PORT"
+                local container_name="cuda-project-${UNIQUE_HASH}-container"
+                if docker exec "$container_name" pgrep -x sshd >/dev/null 2>&1; then
+                    echo "Runtime: listening"
+                else
+                    echo "Runtime: not listening"
+                fi
+            else
+                echo "SSH: disabled"
+            fi
+            ;;
+        passwd)
+            parse_ssh_runtime_options "$@"
+            if [ -n "$GPU_OPTION" ] || [ -n "$SSH_OPTION_PORT" ] || [ ${#RUNTIME_REMAINING_ARGS[@]} -gt 0 ]; then
+                log_error "Usage: cudo ssh passwd [--ssh-password-stdin|--ssh-password-file <file>]"
+                exit 1
+            fi
+            load_config || { log_error "Configuration file not found, please run cudo build first"; exit 1; }
+            if [ -z "$SSH_PORT" ]; then
+                log_error "SSH is not enabled; run cudo ssh enable --port <port> first"
+                exit 1
+            fi
+            if [ "$SSH_OPTION_PASSWORD_PROVIDED" != "true" ]; then
+                read_ssh_password "Enter new SSH password for $SSH_USER: " || exit 1
+                SSH_OPTION_PASSWORD="$SSH_INPUT_PASSWORD"
+                SSH_OPTION_PASSWORD_PROVIDED=true
+            fi
+            update_ssh_runtime_config "$PROJECT_ROOT" "$IMAGE_NAME" "$UNIQUE_HASH" "$CONFIG_FILE" "" "$SSH_OPTION_PASSWORD" true false || exit 1
+            local container_name="cuda-project-${UNIQUE_HASH}-container"
+            if [ "$(check_container_status "$IMAGE_NAME")" = "running" ]; then
+                if ! configure_running_container_ssh "$container_name"; then
+                    rollback_ssh_runtime_config "$PROJECT_ROOT" "$IMAGE_NAME" "$UNIQUE_HASH" "$CONFIG_FILE"
+                    exit 1
+                fi
+            fi
+            ;;
+        disable)
+            if [ $# -gt 0 ]; then
+                log_error "Usage: cudo ssh disable"
+                exit 1
+            fi
+            load_config || { log_error "Configuration file not found, please run cudo build first"; exit 1; }
+            local container_name="cuda-project-${UNIQUE_HASH}-container"
+            if [ "$(check_container_status "$IMAGE_NAME")" = "running" ]; then
+                if ! docker exec "$container_name" sudo rm -f /etc/ssh/sshd_config.d/cudo.conf >/dev/null 2>&1; then
+                    log_error "Failed to remove the container SSH configuration"
+                    exit 1
+                fi
+                docker exec "$container_name" sudo pkill -x sshd >/dev/null 2>&1 || true
+                if docker exec "$container_name" pgrep -x sshd >/dev/null 2>&1; then
+                    log_error "Failed to stop sshd; SSH configuration was not removed from Cudo"
+                    exit 1
+                fi
+            fi
+            disable_ssh_config
+            log_success "SSH disabled and stored credentials removed"
+            ;;
+        *)
+            log_error "Unknown SSH command: $action"
+            log_error "Use: cudo ssh enable|status|passwd|disable"
+            exit 1
+            ;;
+    esac
+}
+
 # 启动命令
 start_command() {
     parse_ssh_runtime_options "$@"
+    GPU_RUNTIME_CONFIGURED=false
     if [ ${#RUNTIME_REMAINING_ARGS[@]} -gt 0 ]; then
         log_error "Unexpected argument: ${RUNTIME_REMAINING_ARGS[0]}"
         usage
@@ -1661,6 +2089,7 @@ start_command() {
 
     local status=$(check_container_status "$IMAGE_NAME")
     local container_name="cuda-project-${UNIQUE_HASH}-container"
+    update_gpu_runtime_config "$PROJECT_ROOT" "$IMAGE_NAME" "$UNIQUE_HASH" "$CONFIG_FILE" "$GPU_OPTION"
     local check_ssh_port=true
     if [ "$status" = "running" ] && [ -z "$SSH_OPTION_PORT" ]; then
         check_ssh_port=false
@@ -1668,14 +2097,15 @@ start_command() {
 
     SSH_RUNTIME_CONFIGURED=false
     if ! update_ssh_runtime_config "$PROJECT_ROOT" "$IMAGE_NAME" "$UNIQUE_HASH" "$CONFIG_FILE" "$SSH_OPTION_PORT" "$SSH_OPTION_PASSWORD" "$SSH_OPTION_PASSWORD_PROVIDED" "$check_ssh_port"; then
+        rollback_gpu_runtime_config "$PROJECT_ROOT" "$IMAGE_NAME" "$UNIQUE_HASH" "$CONFIG_FILE"
         exit 1
     fi
 
     log_info "Starting container..."
-    cd "$CONFIG_DIR"
-    docker_compose_cmd up -d
-    sleep 2
-    configure_running_container_ssh "$container_name"
+    if ! start_container_ready "$CONFIG_DIR" "$container_name" || ! configure_running_container_ssh "$container_name"; then
+        rollback_ssh_runtime_config "$PROJECT_ROOT" "$IMAGE_NAME" "$UNIQUE_HASH" "$CONFIG_FILE"
+        exit 1
+    fi
 }
 
 # 停止命令
@@ -1706,8 +2136,13 @@ restart_command() {
     save_to_global
 
     log_info "Restarting container..."
-    cd "$CONFIG_DIR"
-    docker_compose_cmd restart
+    local container_name="cuda-project-${UNIQUE_HASH}-container"
+    if ! (cd "$CONFIG_DIR" && docker_compose_cmd restart); then
+        log_error "Failed to restart container"
+        exit 1
+    fi
+    wait_for_container_ready "$container_name" || exit 1
+    configure_running_container_ssh "$container_name" || exit 1
 }
 
 # commit
@@ -1836,11 +2271,14 @@ config_command() {
                 echo "  SSH command: ssh -p $SSH_PORT $SSH_USER@<host>"
             else
                 echo "  SSH runtime: not configured"
-                echo "  Configure SSH: cudo run --ssh-port <port> --ssh-password <password>"
+                echo "  Configure SSH: cudo ssh enable --port <port>"
             fi
         else
             echo "  SSH support: disabled"
         fi
+    elif [ -f "$CONFIG_FILE" ]; then
+        log_error "Current configuration is invalid"
+        return 1
     else
         log_info "No configuration found, using defaults:"
         echo "  CUDA version: $DEFAULT_CUDA_VERSION"
@@ -1984,6 +2422,10 @@ enter_global_config() {
     fi
 
     local status=$(get_container_status_by_hash "$unique_hash")
+    GPU_RUNTIME_CONFIGURED=false
+    GPUS=$(read_config_value "$project_config_dir/config" "GPUS")
+    GPUS=${GPUS:-$DEFAULT_GPUS}
+    update_gpu_runtime_config "$project_path" "$image_name" "$unique_hash" "$config_file" "$GPU_OPTION"
     local check_ssh_port=true
     if [ "$status" = "running" ] && [ -z "$SSH_OPTION_PORT" ]; then
         check_ssh_port=false
@@ -1991,21 +2433,29 @@ enter_global_config() {
 
     SSH_RUNTIME_CONFIGURED=false
     if ! update_ssh_runtime_config "$project_path" "$image_name" "$unique_hash" "$config_file" "$SSH_OPTION_PORT" "$SSH_OPTION_PASSWORD" "$SSH_OPTION_PASSWORD_PROVIDED" "$check_ssh_port"; then
+        rollback_gpu_runtime_config "$project_path" "$image_name" "$unique_hash" "$config_file"
         exit 1
     fi
 
     case $status in
         "running")
             log_info "Entering environment: $env_name"
-            configure_running_container_ssh "$container_name"
+            if [ -n "$GPU_OPTION" ] && ! start_container_ready "$project_config_dir" "$container_name"; then
+                rollback_ssh_runtime_config "$project_path" "$image_name" "$unique_hash" "$config_file"
+                exit 1
+            fi
+            if ! configure_running_container_ssh "$container_name"; then
+                rollback_ssh_runtime_config "$project_path" "$image_name" "$unique_hash" "$config_file"
+                exit 1
+            fi
             docker_exec_container "$container_name" "$@"
             ;;
         "stopped"|"nonexistent")
             log_info "Starting environment: $env_name"
-            cd "$project_config_dir"
-            docker_compose_cmd up -d
-            sleep 2
-            configure_running_container_ssh "$container_name"
+            if ! start_container_ready "$project_config_dir" "$container_name" || ! configure_running_container_ssh "$container_name"; then
+                rollback_ssh_runtime_config "$project_path" "$image_name" "$unique_hash" "$config_file"
+                exit 1
+            fi
             docker_exec_container "$container_name" "$@"
             ;;
     esac
@@ -2017,6 +2467,9 @@ enter_command() {
     SSH_OPTION_PORT=""
     SSH_OPTION_PASSWORD=""
     SSH_OPTION_PASSWORD_PROVIDED=false
+    SSH_OPTION_PASSWORD_FILE=""
+    SSH_OPTION_PASSWORD_STDIN=false
+    GPU_OPTION=""
 
     if [ $# -gt 0 ]; then
         while [[ $# -gt 0 ]]; do
@@ -2039,6 +2492,26 @@ enter_command() {
                     fi
                     SSH_OPTION_PASSWORD="$2"
                     SSH_OPTION_PASSWORD_PROVIDED=true
+                    log_warning "--ssh-password exposes the secret in process arguments; prefer an interactive prompt, --ssh-password-stdin, or --ssh-password-file"
+                    shift 2
+                    ;;
+                --ssh-password-file)
+                    if [ $# -lt 2 ]; then
+                        log_error "Missing value for --ssh-password-file"
+                        exit 1
+                    fi
+                    SSH_OPTION_PASSWORD_FILE="$2"
+                    shift 2
+                    ;;
+                --ssh-password-stdin)
+                    SSH_OPTION_PASSWORD_STDIN=true
+                    shift
+                    ;;
+                --gpus)
+                    if [ $# -lt 2 ] || ! validate_gpus "$2"; then
+                        exit 1
+                    fi
+                    GPU_OPTION="$2"
                     shift 2
                     ;;
                 --)
@@ -2058,6 +2531,24 @@ enter_command() {
                     ;;
             esac
         done
+    fi
+
+    local password_sources=0
+    [ "$SSH_OPTION_PASSWORD_PROVIDED" = "true" ] && password_sources=$((password_sources + 1))
+    [ -n "$SSH_OPTION_PASSWORD_FILE" ] && password_sources=$((password_sources + 1))
+    [ "$SSH_OPTION_PASSWORD_STDIN" = "true" ] && password_sources=$((password_sources + 1))
+    if [ "$password_sources" -gt 1 ]; then
+        log_error "Use only one SSH password input method"
+        exit 1
+    fi
+    if [ -n "$SSH_OPTION_PASSWORD_FILE" ]; then
+        read_ssh_password_file "$SSH_OPTION_PASSWORD_FILE" || exit 1
+        SSH_OPTION_PASSWORD="$SSH_INPUT_PASSWORD"
+        SSH_OPTION_PASSWORD_PROVIDED=true
+    elif [ "$SSH_OPTION_PASSWORD_STDIN" = "true" ]; then
+        read_ssh_password_stdin || exit 1
+        SSH_OPTION_PASSWORD="$SSH_INPUT_PASSWORD"
+        SSH_OPTION_PASSWORD_PROVIDED=true
     fi
 
     local selected_config=""
@@ -2178,29 +2669,79 @@ list_command() {
 
 DOCTOR_FAIL_COUNT=0
 DOCTOR_WARN_COUNT=0
+DOCTOR_JSON=false
+DOCTOR_RESULTS=()
+
+json_escape() {
+    local value=$1
+    local escaped=""
+    local char
+    local code
+    local i
+
+    for ((i = 0; i < ${#value}; i++)); do
+        char=${value:i:1}
+        case "$char" in
+            '"') escaped+='\"' ;;
+            '\') escaped+='\\' ;;
+            *)
+                printf -v code '%d' "'$char"
+                if [ "$code" -lt 32 ]; then
+                    printf -v char '\\u%04x' "$code"
+                fi
+                escaped+="$char"
+                ;;
+        esac
+    done
+    JSON_ESCAPED="$escaped"
+}
+
+doctor_emit() {
+    local level=$1
+    local message=$2
+    if [ "$DOCTOR_JSON" = "true" ]; then
+        json_escape "$message"
+        DOCTOR_RESULTS+=("{\"level\":\"$level\",\"message\":\"$JSON_ESCAPED\"}")
+    else
+        printf '%-5s %s\n' "$level" "$message"
+    fi
+}
 
 doctor_pass() {
-    echo "PASS  $1"
+    doctor_emit "PASS" "$1"
 }
 
 doctor_warn() {
     DOCTOR_WARN_COUNT=$((DOCTOR_WARN_COUNT + 1))
-    echo "WARN  $1"
+    doctor_emit "WARN" "$1"
 }
 
 doctor_fail() {
     DOCTOR_FAIL_COUNT=$((DOCTOR_FAIL_COUNT + 1))
-    echo "FAIL  $1"
+    doctor_emit "FAIL" "$1"
 }
 
 doctor_command() {
+    local check_all=false
+    DOCTOR_JSON=false
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --all) check_all=true ;;
+            --json) DOCTOR_JSON=true ;;
+            *) log_error "Unknown doctor option: $1"; return 1 ;;
+        esac
+        shift
+    done
     DOCTOR_FAIL_COUNT=0
     DOCTOR_WARN_COUNT=0
+    DOCTOR_RESULTS=()
 
-    echo "Cudo doctor"
-    echo "Project: $PROJECT_ROOT"
-    echo "Global config: $GLOBAL_CONFIG_DIR"
-    echo
+    if [ "$DOCTOR_JSON" != "true" ]; then
+        echo "Cudo doctor"
+        echo "Project: $PROJECT_ROOT"
+        echo "Global config: $GLOBAL_CONFIG_DIR"
+        echo
+    fi
 
     if command -v docker > /dev/null 2>&1; then
         doctor_pass "docker command found: $(docker --version 2>/dev/null | head -1)"
@@ -2258,13 +2799,15 @@ doctor_command() {
         fi
     fi
 
-    echo
+    [ "$DOCTOR_JSON" = "true" ] || echo
     if [ -f "$CONFIG_FILE" ]; then
         local unique_hash=$(read_config_value "$CONFIG_FILE" "UNIQUE_HASH")
         local image_name=$(read_config_value "$CONFIG_FILE" "IMAGE_NAME")
         local ssh_port=$(read_config_value "$CONFIG_FILE" "SSH_PORT")
         local ssh_password_hash=$(read_config_value "$CONFIG_FILE" "SSH_PASSWORD_HASH_B64")
         local legacy_ssh_password=$(read_config_value "$CONFIG_FILE" "SSH_PASSWORD_B64")
+        local ssh_user=$(read_config_value "$CONFIG_FILE" "SSH_USER")
+        local configured_gpus=$(read_config_value "$CONFIG_FILE" "GPUS")
 
         doctor_pass "Project config found: $CONFIG_FILE"
 
@@ -2288,6 +2831,18 @@ doctor_command() {
             local container_name="cuda-project-${unique_hash}-container"
             if docker ps -a --format '{{.Names}}' | grep -qx "$container_name"; then
                 doctor_pass "Container exists: $container_name"
+                if docker exec "$container_name" test -x /usr/local/bin/cudo-entrypoint >/dev/null 2>&1; then
+                    doctor_pass "Container SSH entrypoint is installed"
+                else
+                    doctor_warn "Container SSH entrypoint is missing; rebuild the image"
+                fi
+                if [ -n "$ssh_port" ]; then
+                    if docker exec "$container_name" pgrep -x sshd >/dev/null 2>&1; then
+                        doctor_pass "Container sshd is running"
+                    else
+                        doctor_warn "Container sshd is not running"
+                    fi
+                fi
             else
                 doctor_warn "Container does not exist yet: $container_name"
             fi
@@ -2308,7 +2863,11 @@ doctor_command() {
         fi
 
         if [ -n "$ssh_password_hash" ]; then
-            doctor_pass "SSH password is stored as a hash"
+            if validate_password_hash_b64 "$ssh_password_hash"; then
+                doctor_pass "SSH password is stored as a SHA-512 hash"
+            else
+                doctor_fail "SSH password hash has an invalid format"
+            fi
         elif [ -n "$legacy_ssh_password" ]; then
             doctor_warn "Legacy SSH_PASSWORD_B64 found; it will be migrated on next SSH configuration"
         elif [ -n "$ssh_port" ]; then
@@ -2316,12 +2875,58 @@ doctor_command() {
         else
             doctor_pass "SSH password is unset"
         fi
-    else
+        if [ -n "$ssh_user" ] && [[ ! "$ssh_user" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+            doctor_fail "SSH user has an invalid format: $ssh_user"
+        fi
+        configured_gpus=${configured_gpus:-$DEFAULT_GPUS}
+        if validate_gpus "$configured_gpus" >/dev/null 2>&1; then
+            doctor_pass "GPU selection is valid: $configured_gpus"
+        else
+            doctor_fail "GPU selection is invalid: $configured_gpus"
+        fi
+    elif [ "$check_all" != "true" ]; then
         doctor_warn "No project config found in current directory"
     fi
 
-    echo
-    echo "Doctor summary: $DOCTOR_FAIL_COUNT fail(s), $DOCTOR_WARN_COUNT warning(s)"
+    if [ "$check_all" = "true" ]; then
+        local global_config
+        for global_config in "$GLOBAL_CONFIG_DIR"/*.conf; do
+            [ -f "$global_config" ] || continue
+            local env_name=$(read_config_value "$global_config" "ENV_NAME")
+            local project_path=$(read_config_value "$global_config" "PROJECT_PATH")
+            local image_name=$(read_config_value "$global_config" "IMAGE_NAME")
+            local ssh_port=$(read_config_value "$global_config" "SSH_PORT")
+            local ssh_hash=$(read_config_value "$global_config" "SSH_PASSWORD_HASH_B64")
+            if [ -n "$project_path" ] && [ -f "$project_path/.cudo/config" ]; then
+                doctor_pass "Environment ${env_name:-unknown}: project config exists"
+            else
+                doctor_warn "Environment ${env_name:-unknown}: project config is missing"
+            fi
+            if [ -n "$image_name" ] && check_image_exists "$image_name"; then
+                doctor_pass "Environment ${env_name:-unknown}: image exists"
+            else
+                doctor_warn "Environment ${env_name:-unknown}: image is missing"
+            fi
+            if [ -n "$ssh_port" ] && ! validate_ssh_port "$ssh_port" >/dev/null 2>&1; then
+                doctor_fail "Environment ${env_name:-unknown}: invalid SSH port $ssh_port"
+            elif [ -n "$ssh_port" ] && [ -z "$ssh_hash" ]; then
+                doctor_warn "Environment ${env_name:-unknown}: SSH password hash is missing"
+            fi
+        done
+    fi
+
+    if [ "$DOCTOR_JSON" = "true" ]; then
+        local joined=""
+        local result
+        for result in "${DOCTOR_RESULTS[@]}"; do
+            [ -z "$joined" ] || joined+=","
+            joined+="$result"
+        done
+        printf '{"failures":%d,"warnings":%d,"checks":[%s]}\n' "$DOCTOR_FAIL_COUNT" "$DOCTOR_WARN_COUNT" "$joined"
+    else
+        echo
+        echo "Doctor summary: $DOCTOR_FAIL_COUNT fail(s), $DOCTOR_WARN_COUNT warning(s)"
+    fi
     if [ "$DOCTOR_FAIL_COUNT" -gt 0 ]; then
         return 1
     fi
@@ -2350,7 +2955,8 @@ Commands:
   remove             Delete container, image and configuration files
   config             Show current configuration
   list [options]     List all CUDA environments
-  doctor             Diagnose Cudo dependencies and current project config
+  ssh <command>      Manage SSH (enable, status, passwd, disable)
+  doctor [options]   Diagnose dependencies and project configurations
   cleanup            Clean up deleted/moved project configurations
   help               Show this help message
 
@@ -2364,7 +2970,14 @@ Build options:
 
 Runtime SSH options for run/start/enter:
       --ssh-port         Start SSH on the given host port
-      --ssh-password     Password for SSH login
+      --ssh-password-stdin       Read the password from standard input
+      --ssh-password-file FILE   Read the password from the first line of FILE
+      --ssh-password VALUE       Deprecated; exposes the password in process arguments
+      --gpus DEVICES             Use all, none, or a device list such as 0,1
+
+Doctor options:
+      --all              Check every registered Cudo environment
+      --json             Emit machine-readable JSON
 
 List options:
   -d, --details      Show detailed resource information (CPU, memory usage, etc.)
@@ -2373,7 +2986,10 @@ List options:
 Examples:
   cudo build -c 11.8.0 -p 3.8
   cudo build --name train
-  cudo run --ssh-port 2222 --ssh-password my-password
+  cudo ssh enable --port 2222
+  cudo ssh passwd
+  printf '%s\n' 'secret' | cudo run --ssh-port 2222 --ssh-password-stdin
+  cudo run --gpus 0,1
   ssh -p 2222 $USER@<host>
   cudo enter train --ssh-port 2223
   cudo enter train -- nvidia-smi
@@ -2415,6 +3031,9 @@ main() {
             ;;
         "enter")
             enter_command "$@"
+            ;;
+        "ssh")
+            ssh_command "$@"
             ;;
         "rename")
             rename_command "$@"
@@ -2470,7 +3089,7 @@ main() {
             list_command "$show_details" "$show_gpu"
             ;;
         "doctor")
-            doctor_command
+            doctor_command "$@"
             ;;
         "cleanup")
             cleanup_deleted_projects

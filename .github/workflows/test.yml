@@ -1,0 +1,29 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fast:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install test dependencies
+        run: sudo apt-get update && sudo apt-get install -y gettext shellcheck
+      - name: Check shell scripts
+        run: shellcheck --severity=error cudo tests/*.sh
+      - name: Run fast tests
+        run: ./tests/run_all_tests.sh
+
+  integration:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, linux, gpu]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Docker and NVIDIA integration tests
+        run: ./tests/run_all_tests.sh --integration
