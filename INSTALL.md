@@ -24,7 +24,11 @@ After installation, the file structure should look like this:
 ```
 /usr/local/bin/cudo                  # Main executable
 /usr/local/share/cudo/               # Support files directory
-└── cuda-env-list-simple.py         # Python helper script
+├── cuda-env-list-simple.py         # Environment list helper
+└── cudo-smi.py                     # Container GPU process client
+/usr/local/libexec/cudo-gpu-agent   # Host GPU process agent
+/etc/systemd/system/cudo-gpu-agent.service
+/run/cudo/gpu-agent.sock            # Runtime Unix socket
 /var/lib/cudo-global/                # Global configuration directory (multi-user support)
 └── *.conf                          # Project metadata files
 ```
@@ -79,6 +83,10 @@ cudo list
 
 # Diagnose Docker, NVIDIA runtime, Compose, and required host tools
 cudo doctor
+
+# Verify the filtered GPU process agent
+systemctl status cudo-gpu-agent
+test -S /run/cudo/gpu-agent.sock
 ```
 
 ## Dependencies
@@ -115,6 +123,10 @@ cudo doctor
 sudo rm -f /usr/local/bin/cudo
 sudo rm -rf /usr/local/share/cudo
 sudo rm -rf /var/lib/cudo-global
+sudo systemctl disable --now cudo-gpu-agent.service
+sudo rm -f /etc/systemd/system/cudo-gpu-agent.service
+sudo rm -f /usr/local/libexec/cudo-gpu-agent
+sudo systemctl daemon-reload
 ```
 
 ## Support

@@ -59,6 +59,12 @@ if ! curl -fsSL "$REPO_URL/scripts/cuda-env-list-simple.py" -o scripts/cuda-env-
     log_error "Failed to download helper scripts"
     exit 1
 fi
+for helper in cudo-smi.py cudo-gpu-agent.py cudo-gpu-agent.service; do
+    if ! curl -fsSL "$REPO_URL/scripts/$helper" -o "scripts/$helper"; then
+        log_error "Failed to download $helper"
+        exit 1
+    fi
+done
 
 # Run install script
 log_info "Running installation script..."

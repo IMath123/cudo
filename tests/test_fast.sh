@@ -196,6 +196,12 @@ EOF
 exit 0
 EOF
     chmod +x "$FAKE_BIN/sleep"
+
+    cat > "$FAKE_BIN/nvidia-smi" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+    chmod +x "$FAKE_BIN/nvidia-smi"
 }
 
 global_config_for_hash() {
@@ -232,6 +238,7 @@ syntax_checks() {
     bash -n "$SCRIPT_DIR/run_all_tests.sh"
     bash -n "$SCRIPT_DIR/test_fast.sh"
     python3 -m py_compile "$ROOT_DIR/scripts/cuda-env-list-simple.py"
+    python3 -m py_compile "$ROOT_DIR/scripts/cudo-gpu-agent.py" "$ROOT_DIR/scripts/cudo-smi.py" "$SCRIPT_DIR/test_gpu_tools.py"
     if command -v shellcheck >/dev/null 2>&1; then
         shellcheck "$CUDO" "$SCRIPT_DIR"/*.sh
     fi
@@ -258,6 +265,10 @@ doctor_is_read_only_without_global_dir() {
     assert_contains "$output" 'Global config directory does not exist yet'
 }
 
+gpu_tool_unit_tests() {
+    python3 "$SCRIPT_DIR/test_gpu_tools.py"
+}
+
 build_has_no_default_ssh_port() {
     mkdir -p "$GLOBAL_DIR" "$PROJECT_DIR"
 
@@ -270,6 +281,9 @@ build_has_no_default_ssh_port() {
     assert_contains "$config_file" '^SSH_PORT=$'
     assert_contains "$config_file" '^SSH_PASSWORD_HASH_B64=$'
     assert_not_contains "$config_file" '^SSH_PASSWORD_B64='
+    assert_file_exists "$PROJECT_DIR/.cudo/cudo-smi.py"
+    assert_contains "$PROJECT_DIR/.cudo/Dockerfile" '^COPY cudo-smi.py /usr/local/bin/cudo-smi$'
+    assert_contains "$PROJECT_DIR/.cudo/docker-compose.yml" '/run/cudo:/run/cudo:ro'
 
     cudo_fast list > "$TMP_DIR/list-no-ssh.out"
     assert_contains "$TMP_DIR/list-no-ssh.out" '^.*SSH.*$'
@@ -481,6 +495,7 @@ main() {
     make_fake_tools
 
     test_case "syntax checks" syntax_checks
+    test_case "GPU agent and client unit tests" gpu_tool_unit_tests
     test_case "doctor is read-only without global config dir" doctor_is_read_only_without_global_dir
     test_case "build has no default SSH port" build_has_no_default_ssh_port
     test_case "runtime SSH password is stored as a hash" runtime_password_is_hashed

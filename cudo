@@ -24,6 +24,7 @@ CONFIG_FILE="$CONFIG_DIR/config"
 DOCKERFILE="$CONFIG_DIR/Dockerfile"
 DOCKER_COMPOSE_FILE="$CONFIG_DIR/docker-compose.yml"
 SSH_ENTRYPOINT_FILE="$CONFIG_DIR/cudo-entrypoint.sh"
+CUDO_SMI_FILE="$CONFIG_DIR/cudo-smi.py"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -850,6 +851,7 @@ services:
       - ..:/workspace
       - /tmp/.X11-unix:/tmp/.X11-unix
       - /dev/shm:/dev/shm
+      - /run/cudo:/run/cudo:ro
     working_dir: /workspace
     stdin_open: true
     tty: true
@@ -961,6 +963,19 @@ configure_cudo_ssh
 exec "$@"
 EOF
     chmod 755 "$SSH_ENTRYPOINT_FILE"
+}
+
+prepare_cudo_smi_file() {
+    local source_file="$PYTHON_SCRIPT_DIR/cudo-smi.py"
+    if [ ! -f "$source_file" ] && [ -f "$SCRIPT_DIR/cudo-smi.py" ]; then
+        source_file="$SCRIPT_DIR/cudo-smi.py"
+    fi
+    if [ ! -f "$source_file" ]; then
+        log_error "cudo-smi client not found: $source_file"
+        return 1
+    fi
+    cp "$source_file" "$CUDO_SMI_FILE"
+    chmod 755 "$CUDO_SMI_FILE"
 }
 
 update_ssh_runtime_config() {
@@ -1272,8 +1287,9 @@ RUN groupadd -g ${current_gid} ${current_user} && \\
 
 # 配置运行时 SSH 支持
 COPY cudo-entrypoint.sh /usr/local/bin/cudo-entrypoint
+COPY cudo-smi.py /usr/local/bin/cudo-smi
 RUN mkdir -p /run/sshd /etc/ssh/sshd_config.d && \\
-    chmod 755 /usr/local/bin/cudo-entrypoint && \\
+    chmod 755 /usr/local/bin/cudo-entrypoint /usr/local/bin/cudo-smi && \\
     ssh-keygen -A && \\
     if ! grep -q '^Include /etc/ssh/sshd_config.d/\\*.conf' /etc/ssh/sshd_config; then \\
         sed -i '1i Include /etc/ssh/sshd_config.d/*.conf' /etc/ssh/sshd_config; \\
@@ -1703,6 +1719,7 @@ build_command() {
         fi
     fi
     prepare_ssh_build_files
+    prepare_cudo_smi_file || exit 1
 
     echo "Build configuration:"
     echo "  CUDA version: $CUDA_VERSION"
@@ -2781,6 +2798,23 @@ doctor_command() {
         fi
     else
         doctor_fail "openssl is missing"
+    fi
+
+    if command -v nvidia-smi > /dev/null 2>&1; then
+        doctor_pass "host nvidia-smi is available"
+    else
+        doctor_fail "host nvidia-smi is missing"
+    fi
+
+    if [ -S /run/cudo/gpu-agent.sock ]; then
+        doctor_pass "Cudo GPU agent socket is available"
+    else
+        doctor_warn "Cudo GPU agent socket is unavailable; cudo-smi will not work in containers"
+    fi
+    if command -v systemctl > /dev/null 2>&1 && systemctl is-active --quiet cudo-gpu-agent.service 2>/dev/null; then
+        doctor_pass "Cudo GPU agent service is running"
+    elif command -v systemctl > /dev/null 2>&1; then
+        doctor_warn "Cudo GPU agent service is not running"
     fi
 
     if [ -d "$GLOBAL_CONFIG_DIR" ]; then

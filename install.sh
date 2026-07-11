@@ -132,6 +132,9 @@ check_dependencies() {
     if ! command -v python3 &> /dev/null; then
         missing+=("python3")
     fi
+    if ! command -v nvidia-smi &> /dev/null; then
+        missing+=("nvidia-smi")
+    fi
     
     if [ ${#missing[@]} -ne 0 ]; then
         log_error "Missing dependencies: ${missing[*]}"
@@ -142,6 +145,9 @@ check_dependencies() {
                     echo "  Python 3:"
                     echo "    Ubuntu/Debian: sudo apt-get install python3"
                     echo "    CentOS/RHEL: sudo yum install python3"
+                    ;;
+                "nvidia-smi")
+                    echo "  NVIDIA driver tools: install a compatible NVIDIA driver on the host"
                     ;;
             esac
         done
@@ -165,6 +171,19 @@ install_system_wide() {
     local scripts_dir="/usr/local/share/cudo"
     sudo mkdir -p "$scripts_dir"
     sudo cp "$PROJECT_ROOT/scripts/cuda-env-list-simple.py" "$scripts_dir/"
+    sudo cp "$PROJECT_ROOT/scripts/cudo-smi.py" "$scripts_dir/"
+
+    # Install the host-side GPU process agent.
+    sudo mkdir -p /usr/local/libexec
+    sudo cp "$PROJECT_ROOT/scripts/cudo-gpu-agent.py" /usr/local/libexec/cudo-gpu-agent
+    sudo chmod 755 /usr/local/libexec/cudo-gpu-agent
+    if command -v systemctl >/dev/null 2>&1; then
+        sudo cp "$PROJECT_ROOT/scripts/cudo-gpu-agent.service" /etc/systemd/system/cudo-gpu-agent.service
+        sudo systemctl daemon-reload
+        sudo systemctl enable --now cudo-gpu-agent.service
+    else
+        log_warning "systemd was not found; start /usr/local/libexec/cudo-gpu-agent manually"
+    fi
     
     # Update script path in main script
     sudo sed -i "s|SCRIPT_DIR=.*|SCRIPT_DIR=\"$scripts_dir\"|" "$install_dir/$script_name"
@@ -177,6 +196,7 @@ install_system_wide() {
     log_success "Installed $script_name to $install_dir"
     log_success "Support files installed to $scripts_dir"
     log_success "Global configuration directory created: $global_config_dir"
+    log_success "GPU process agent installed"
 }
 
 # Main installation
@@ -199,6 +219,7 @@ main() {
     echo "  cudo run"
     echo "  cudo enter <environment-name>"
     echo "  cudo enter <environment-name> -- nvidia-smi"
+    echo "  cudo enter <environment-name> -- cudo-smi"
     echo "  cudo list"
     echo "  cudo rename <old-name> <new-name>"
     echo

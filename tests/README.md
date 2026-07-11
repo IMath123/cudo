@@ -6,6 +6,7 @@ This directory contains the formal Cudo test entry points.
 
 - `run_all_tests.sh`: main runner. Defaults to fast tests and exposes opt-in integration modes.
 - `test_fast.sh`: no real Docker daemon or GPU. Uses fake `docker` and `envsubst` commands plus real `openssl`.
+- `test_gpu_tools.py`: unit coverage for cgroup filtering, namespace PID translation, and the Unix socket client.
 - `test_cudo.sh`: Docker/NVIDIA integration coverage for core commands and lifecycle behavior.
 - `test_complex_scenarios.sh`: Docker/NVIDIA integration coverage for copy, move, conflict, cleanup, and multi-environment cases.
 - `test_utils.py`: Python integration helpers and subprocess-based lifecycle checks.

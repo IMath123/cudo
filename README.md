@@ -17,6 +17,7 @@ A powerful command-line tool for managing CUDA development environments using Do
 - **Docker Integration**: Seamless integration with Docker and Docker Compose
 - **Runtime SSH Access**: Password-authenticated SSH with no default listening port
 - **GPU Selection**: Select all, no, or specific GPUs when starting an environment
+- **Container GPU Process View**: Use `cudo-smi` with container-local PIDs without exposing host processes
 - **Diagnostics and CI**: Built-in health checks plus automated fast tests
 
 ## 💡 Why Cudo?
@@ -173,6 +174,35 @@ cudo remove
 
 `--gpus` accepts `all`, `none`, or comma-separated numeric device IDs such as `0,1`. It is supported by `run`, `start`, and `enter`. Changing it for a running environment recreates the container with the new visibility setting while preserving the project volume.
 
+### GPU Process View
+
+Run `cudo-smi` inside a Cudo container to list only GPU processes owned by that container. The displayed PID is the container PID, so it can be used directly with container tools such as `ps` and `kill`.
+
+```bash
+# Inside the container
+cudo-smi
+cudo-smi --watch 1
+cudo-smi --json
+```
+
+Example:
+
+```text
+GPU  PID  GPU MEMORY  COMMAND
+0    317  8124 MiB    python train.py
+0    428  2048 MiB    python inference.py
+```
+
+The client connects to `/run/cudo/gpu-agent.sock`, which is mounted read-only from the host. The host agent obtains GPU process host PIDs from `nvidia-smi`, verifies that each process belongs to the caller's container cgroup, and translates it through `/proc/PID/status` `NSpid`. It never returns GPU processes from another container or ordinary host process information. Cudo does not mount the Docker socket and does not use the host PID namespace.
+
+`cudo-smi` requires the `cudo-gpu-agent.service` installed by `install.sh`. Existing images must be rebuilt once to include the client:
+
+```bash
+sudo systemctl status cudo-gpu-agent
+cudo doctor
+cudo build
+```
+
 ### SSH Commands
 
 Every image built by Cudo contains the SSH server packages, but SSH is disabled until both a port and password are explicitly configured. There is no default SSH port.
@@ -251,7 +281,7 @@ cudo doctor --all --json
 
 This command only reports `PASS`, `WARN`, and `FAIL` checks. It does not modify your environment.
 
-`doctor` checks Docker, Compose, the NVIDIA runtime, required host tools, global configuration access, the current image and container, SSH configuration, SSH runtime state, and GPU selection. `--all` also checks every environment in the global registry. `--json` returns an object with `failures`, `warnings`, and `checks`; the command exits non-zero when any `FAIL` check is present.
+`doctor` checks Docker, Compose, the NVIDIA runtime, required host tools, the Cudo GPU agent, global configuration access, the current image and container, SSH configuration, SSH runtime state, and GPU selection. `--all` also checks every environment in the global registry. `--json` returns an object with `failures`, `warnings`, and `checks`; the command exits non-zero when any `FAIL` check is present.
 
 ## 🔧 Command Options
 
@@ -312,6 +342,8 @@ Statistics:
 
 /var/lib/cudo-global/        # Global configuration (multi-user support)
 └── *.conf                  # Project metadata files
+
+/run/cudo/gpu-agent.sock     # Filtered host GPU process API
 ```
 
 ## 🔍 How It Works
@@ -324,6 +356,7 @@ Statistics:
 6. **Resource Monitoring**: Integrates with Docker stats and NVIDIA tools
 7. **Runtime SSH Access**: Starts `sshd` only after an explicit port and password are configured
 8. **Safe Configuration Loading**: Parses and validates known fields without executing the config as shell code
+9. **PID Translation**: Filters GPU processes by cgroup and translates host PIDs into container PIDs
 
 ## 🐛 Troubleshooting
 
@@ -383,6 +416,17 @@ cudo start --gpus 0,1
 
 # Confirm the saved selection and NVIDIA runtime
 cudo doctor
+```
+
+**`cudo-smi` cannot connect to the GPU agent**
+```bash
+# Run these commands on the host
+sudo systemctl status cudo-gpu-agent
+sudo systemctl restart cudo-gpu-agent
+cudo doctor
+
+# Rebuild old images that do not contain the client
+cudo build
 ```
 
 **Too many deleted projects in list**
