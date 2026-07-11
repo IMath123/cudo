@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import importlib.util
+import importlib.machinery
 import json
 import socket
 import tempfile
@@ -14,7 +15,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def load_module(name, filename):
-    spec = importlib.util.spec_from_file_location(name, ROOT / "scripts" / filename)
+    path = ROOT / "scripts" / filename
+    spec = importlib.util.spec_from_loader(name, importlib.machinery.SourceFileLoader(name, str(path)))
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -22,6 +24,7 @@ def load_module(name, filename):
 
 agent = load_module("cudo_gpu_agent", "cudo-gpu-agent.py")
 client = load_module("cudo_smi", "cudo-smi.py")
+wrapper = load_module("cudo_nvidia_smi", "nvidia-smi")
 
 
 class AgentTests(unittest.TestCase):
@@ -47,7 +50,7 @@ class AgentTests(unittest.TestCase):
              mock.patch.object(agent, "process_command", return_value="python train.py"):
             self.assertEqual(
                 agent.gpu_processes("mine"),
-                [{"gpu": 0, "pid": 317, "memory_mib": 8124, "command": "python train.py"}],
+                [{"gpu": 0, "pid": 317, "host_pid": 48120, "memory_mib": 8124, "command": "python train.py"}],
             )
 
 
@@ -63,7 +66,7 @@ class ClientTests(unittest.TestCase):
                 listener.listen(1)
                 ready.set()
                 connection, _ = listener.accept()
-                connection.sendall(json.dumps({"ok": True, "processes": [{"pid": 7}]}).encode() + b"\n")
+                connection.sendall(json.dumps({"ok": True, "processes": [{"pid": 7, "host_pid": 70}]}).encode() + b"\n")
                 connection.close()
                 listener.close()
 
@@ -72,6 +75,34 @@ class ClientTests(unittest.TestCase):
             ready.wait(2)
             self.assertEqual(client.fetch(socket_path), [{"pid": 7}])
             thread.join(2)
+
+
+class NvidiaSmiWrapperTests(unittest.TestCase):
+    def test_default_process_table_filters_and_translates_pids(self):
+        output = (
+            "| Processes:                                                                  |\n"
+            "|  GPU   GI   CI        PID   Type   Process name                  GPU Memory |\n"
+            "|    0   N/A  N/A     48120      C   python                         8124MiB |\n"
+            "|    0   N/A  N/A     90000      C   other                           100MiB |\n"
+            "+-----------------------------------------------------------------------------+\n"
+        )
+        processes = [{"host_pid": 48120, "pid": 317, "gpu": 0, "memory_mib": 8124, "command": "python train.py"}]
+        rewritten = wrapper.rewrite_default_output(output, processes)
+        self.assertIn("317", rewritten)
+        self.assertNotIn("48120", rewritten)
+        self.assertNotIn("90000", rewritten)
+
+    def test_default_empty_table_is_populated_from_agent(self):
+        output = "| Processes: |\n|================|\n+----------------+\n"
+        processes = [{"host_pid": 48120, "pid": 317, "gpu": 0, "memory_mib": 8124, "command": "python train.py"}]
+        rewritten = wrapper.rewrite_default_output(output, processes)
+        self.assertIn("317", rewritten)
+        self.assertIn("8124MiB", rewritten)
+
+    def test_compute_query_filters_and_translates_pid_column(self):
+        output = "python, 48120, 8124 MiB\nother, 90000, 100 MiB\n"
+        rewritten = wrapper.rewrite_query_output(output, ["process_name", "pid", "used_memory"], {48120: 317})
+        self.assertEqual(rewritten, "python, 317, 8124 MiB\n")
 
 
 if __name__ == "__main__":

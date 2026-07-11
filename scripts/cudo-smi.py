@@ -28,7 +28,10 @@ def fetch(socket_path):
         client.close()
     if not response.get("ok"):
         raise RuntimeError(response.get("error", "GPU agent request failed"))
-    return response["processes"]
+    return [
+        {key: value for key, value in process.items() if key != "host_pid"}
+        for process in response["processes"]
+    ]
 
 
 def format_table(processes):

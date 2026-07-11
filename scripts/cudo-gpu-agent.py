@@ -109,6 +109,7 @@ def gpu_processes(container_id):
             {
                 "gpu": indices.get(fields[2]),
                 "pid": namespace_pid,
+                "host_pid": host_pid,
                 "memory_mib": memory_mib,
                 "command": process_command(host_pid, fields[3] if has_process_name else "unknown"),
             }

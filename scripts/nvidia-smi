@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+
+
+AGENT_SOCKET = "/run/cudo/gpu-agent.sock"
+DEFAULT_PROCESS_ROW = re.compile(r"^(\|\s*\d+\s+\S+\s+\S+\s+)(\d+)(\s+.*\|)$")
+
+
+def real_nvidia_smi():
+    wrapper = os.path.realpath(__file__)
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        candidate = os.path.realpath(os.path.join(directory or ".", "nvidia-smi"))
+        if candidate != wrapper and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    for candidate in ("/usr/bin/nvidia-smi", "/bin/nvidia-smi"):
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def container_processes():
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        client.settimeout(10)
+        client.connect(AGENT_SOCKET)
+        stream = client.makefile("rb")
+        response = json.loads(stream.readline(1024 * 1024))
+    finally:
+        client.close()
+    if not response.get("ok"):
+        raise RuntimeError(response.get("error", "GPU agent request failed"))
+    return response["processes"]
+
+
+def query_fields(arguments):
+    for index, argument in enumerate(arguments):
+        if argument.startswith("--query-compute-apps="):
+            return [field.strip() for field in argument.split("=", 1)[1].split(",")]
+        if argument == "--query-compute-apps" and index + 1 < len(arguments):
+            return [field.strip() for field in arguments[index + 1].split(",")]
+    return None
+
+
+def rewrite_query_output(output, fields, mapping):
+    if "pid" not in fields:
+        raise RuntimeError("--query-compute-apps must include pid inside a Cudo container")
+    pid_index = fields.index("pid")
+    rewritten = []
+    for line in output.splitlines(keepends=True):
+        columns = [column.strip() for column in line.rstrip("\r\n").split(",")]
+        if pid_index >= len(columns) or not columns[pid_index].isdigit():
+            rewritten.append(line)
+            continue
+        host_pid = int(columns[pid_index])
+        if host_pid not in mapping:
+            continue
+        columns[pid_index] = str(mapping[host_pid])
+        ending = "\n" if line.endswith("\n") else ""
+        rewritten.append(", ".join(columns) + ending)
+    return "".join(rewritten)
+
+
+def synthetic_process_row(process):
+    gpu = "N/A" if process.get("gpu") is None else str(process["gpu"])
+    command = os.path.basename(process.get("command", "unknown").split()[0])[:38]
+    memory = "N/A" if process.get("memory_mib") is None else f'{process["memory_mib"]}MiB'
+    return f"|  {gpu:>3}   N/A  N/A  {process['pid']:>9}      C   {command:<38} {memory:>8} |\n"
+
+
+def rewrite_default_output(output, processes):
+    mapping = {int(item["host_pid"]): int(item["pid"]) for item in processes}
+    result = []
+    in_process_table = False
+    process_rows = 0
+    after_process_header = False
+    for line in output.splitlines(keepends=True):
+        if line.startswith("| Processes:"):
+            in_process_table = True
+        if in_process_table and line.startswith("|==="):
+            after_process_header = True
+        match = DEFAULT_PROCESS_ROW.match(line.rstrip("\r\n")) if in_process_table else None
+        if match:
+            host_pid = int(match.group(2))
+            if host_pid not in mapping:
+                continue
+            ending = "\n" if line.endswith("\n") else ""
+            line = f"{match.group(1)}{mapping[host_pid]}{match.group(3)}{ending}"
+            process_rows += 1
+        if in_process_table and after_process_header and line.startswith("+") and process_rows == 0:
+            result.extend(synthetic_process_row(process) for process in processes)
+            process_rows = len(processes)
+        result.append(line)
+    return "".join(result)
+
+
+def main():
+    binary = real_nvidia_smi()
+    if not binary:
+        print("nvidia-smi: real NVIDIA utility was not found", file=sys.stderr)
+        return 127
+    completed = subprocess.run([binary, *sys.argv[1:]], capture_output=True, text=True)
+    if completed.returncode != 0:
+        sys.stdout.write(completed.stdout)
+        sys.stderr.write(completed.stderr)
+        return completed.returncode
+    try:
+        processes = container_processes()
+        mapping = {int(item["host_pid"]): int(item["pid"]) for item in processes}
+        fields = query_fields(sys.argv[1:])
+        output = rewrite_query_output(completed.stdout, fields, mapping) if fields else rewrite_default_output(completed.stdout, processes)
+    except (OSError, ValueError, json.JSONDecodeError, RuntimeError) as exc:
+        print(f"nvidia-smi: {exc}", file=sys.stderr)
+        return 1
+    sys.stdout.write(output)
+    sys.stderr.write(completed.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

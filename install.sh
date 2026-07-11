@@ -172,6 +172,8 @@ install_system_wide() {
     sudo mkdir -p "$scripts_dir"
     sudo cp "$PROJECT_ROOT/scripts/cuda-env-list-simple.py" "$scripts_dir/"
     sudo cp "$PROJECT_ROOT/scripts/cudo-smi.py" "$scripts_dir/"
+    sudo cp "$PROJECT_ROOT/scripts/nvidia-smi" "$scripts_dir/"
+    sudo chmod 755 "$scripts_dir/cudo-smi.py" "$scripts_dir/nvidia-smi"
 
     # Install the host-side GPU process agent.
     sudo mkdir -p /usr/local/libexec

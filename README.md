@@ -195,7 +195,9 @@ GPU  PID  GPU MEMORY  COMMAND
 
 The client connects to `/run/cudo/gpu-agent.sock`, which is mounted read-only from the host. The host agent obtains GPU process host PIDs from `nvidia-smi`, verifies that each process belongs to the caller's container cgroup, and translates it through `/proc/PID/status` `NSpid`. It never returns GPU processes from another container or ordinary host process information. Cudo does not mount the Docker socket and does not use the host PID namespace.
 
-`cudo-smi` requires the `cudo-gpu-agent.service` installed by `install.sh`. Existing images must be rebuilt once to include the client:
+Cudo also installs `/usr/local/bin/nvidia-smi` inside the container as a compatibility wrapper. GPU and driver information still comes from the real NVIDIA utility, while its process table is limited to the current container and displays container-local PIDs. Scripts can therefore continue using `nvidia-smi` without PID translation changes. Compute-process CSV queries are supported when `--query-compute-apps` includes the `pid` field.
+
+`cudo-smi` and the container-aware `nvidia-smi` wrapper require the `cudo-gpu-agent.service` installed by `install.sh`. They are included only in newly built images. Existing environments are not modified automatically because recreating a container can discard changes in its writable layer.
 
 ```bash
 sudo systemctl status cudo-gpu-agent

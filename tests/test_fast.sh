@@ -140,12 +140,14 @@ case "$1" in
         fi
         ;;
     compose)
-        case "${2:-}" in
+        shift
+        while [ "${1:-}" = "-f" ]; do shift 2; done
+        case "${1:-}" in
             version)
                 echo "Docker Compose version v2.99.0"
                 ;;
-            build|up|stop|restart|down|logs)
-                if [ "${2:-}" = "up" ] && [ "${CUDO_FAKE_COMPOSE_FAIL:-false}" = "true" ]; then
+            build|up|stop|restart|down|logs|config)
+                if [ "${1:-}" = "up" ] && [ "${CUDO_FAKE_COMPOSE_FAIL:-false}" = "true" ]; then
                     exit 1
                 fi
                 ;;
@@ -238,7 +240,7 @@ syntax_checks() {
     bash -n "$SCRIPT_DIR/run_all_tests.sh"
     bash -n "$SCRIPT_DIR/test_fast.sh"
     python3 -m py_compile "$ROOT_DIR/scripts/cuda-env-list-simple.py"
-    python3 -m py_compile "$ROOT_DIR/scripts/cudo-gpu-agent.py" "$ROOT_DIR/scripts/cudo-smi.py" "$SCRIPT_DIR/test_gpu_tools.py"
+    python3 -m py_compile "$ROOT_DIR/scripts/cudo-gpu-agent.py" "$ROOT_DIR/scripts/cudo-smi.py" "$ROOT_DIR/scripts/nvidia-smi" "$SCRIPT_DIR/test_gpu_tools.py"
     if command -v shellcheck >/dev/null 2>&1; then
         shellcheck "$CUDO" "$SCRIPT_DIR"/*.sh
     fi
@@ -282,13 +284,23 @@ build_has_no_default_ssh_port() {
     assert_contains "$config_file" '^SSH_PASSWORD_HASH_B64=$'
     assert_not_contains "$config_file" '^SSH_PASSWORD_B64='
     assert_file_exists "$PROJECT_DIR/.cudo/cudo-smi.py"
+    assert_file_exists "$PROJECT_DIR/.cudo/nvidia-smi"
     assert_contains "$PROJECT_DIR/.cudo/Dockerfile" '^COPY cudo-smi.py /usr/local/bin/cudo-smi$'
+    assert_contains "$PROJECT_DIR/.cudo/Dockerfile" '^COPY nvidia-smi /usr/local/bin/nvidia-smi$'
     assert_contains "$PROJECT_DIR/.cudo/docker-compose.yml" '/run/cudo:/run/cudo:ro'
 
     cudo_fast list > "$TMP_DIR/list-no-ssh.out"
     assert_contains "$TMP_DIR/list-no-ssh.out" '^.*SSH.*$'
     assert_contains "$TMP_DIR/list-no-ssh.out" 'fast'
     assert_contains "$TMP_DIR/list-no-ssh.out" '[[:space:]]-[[:space:]]'
+}
+
+upgrade_command_is_disabled() {
+    if cudo_fast upgrade fast > "$TMP_DIR/upgrade-disabled.out" 2>&1; then
+        printf 'Expected cudo upgrade to be rejected\n' >&2
+        return 1
+    fi
+    assert_contains "$TMP_DIR/upgrade-disabled.out" 'Unknown command: upgrade'
 }
 
 runtime_password_is_hashed() {
@@ -498,6 +510,7 @@ main() {
     test_case "GPU agent and client unit tests" gpu_tool_unit_tests
     test_case "doctor is read-only without global config dir" doctor_is_read_only_without_global_dir
     test_case "build has no default SSH port" build_has_no_default_ssh_port
+    test_case "upgrade command is disabled" upgrade_command_is_disabled
     test_case "runtime SSH password is stored as a hash" runtime_password_is_hashed
     test_case "run and enter can update SSH port" run_and_enter_can_update_ssh_port
     test_case "list shows configured SSH port" list_shows_configured_ssh_port

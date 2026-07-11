@@ -25,6 +25,7 @@ DOCKERFILE="$CONFIG_DIR/Dockerfile"
 DOCKER_COMPOSE_FILE="$CONFIG_DIR/docker-compose.yml"
 SSH_ENTRYPOINT_FILE="$CONFIG_DIR/cudo-entrypoint.sh"
 CUDO_SMI_FILE="$CONFIG_DIR/cudo-smi.py"
+NVIDIA_SMI_WRAPPER_FILE="$CONFIG_DIR/nvidia-smi"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -976,6 +977,17 @@ prepare_cudo_smi_file() {
     fi
     cp "$source_file" "$CUDO_SMI_FILE"
     chmod 755 "$CUDO_SMI_FILE"
+
+    source_file="$PYTHON_SCRIPT_DIR/nvidia-smi"
+    if [ ! -f "$source_file" ] && [ -f "$SCRIPT_DIR/nvidia-smi" ]; then
+        source_file="$SCRIPT_DIR/nvidia-smi"
+    fi
+    if [ ! -f "$source_file" ]; then
+        log_error "nvidia-smi wrapper not found: $source_file"
+        return 1
+    fi
+    cp "$source_file" "$NVIDIA_SMI_WRAPPER_FILE"
+    chmod 755 "$NVIDIA_SMI_WRAPPER_FILE"
 }
 
 update_ssh_runtime_config() {
@@ -1288,8 +1300,9 @@ RUN groupadd -g ${current_gid} ${current_user} && \\
 # 配置运行时 SSH 支持
 COPY cudo-entrypoint.sh /usr/local/bin/cudo-entrypoint
 COPY cudo-smi.py /usr/local/bin/cudo-smi
+COPY nvidia-smi /usr/local/bin/nvidia-smi
 RUN mkdir -p /run/sshd /etc/ssh/sshd_config.d && \\
-    chmod 755 /usr/local/bin/cudo-entrypoint /usr/local/bin/cudo-smi && \\
+    chmod 755 /usr/local/bin/cudo-entrypoint /usr/local/bin/cudo-smi /usr/local/bin/nvidia-smi && \\
     ssh-keygen -A && \\
     if ! grep -q '^Include /etc/ssh/sshd_config.d/\\*.conf' /etc/ssh/sshd_config; then \\
         sed -i '1i Include /etc/ssh/sshd_config.d/*.conf' /etc/ssh/sshd_config; \\
