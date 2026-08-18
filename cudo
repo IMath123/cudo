@@ -57,6 +57,7 @@ load_config_values() {
     UNIQUE_HASH=$(read_config_value "$config_file" "UNIQUE_HASH")
     ENV_NAME=$(read_config_value "$config_file" "ENV_NAME")
     GPUS=$(read_config_value "$config_file" "GPUS")
+    EXTRA_VOLUMES=$(read_config_value "$config_file" "EXTRA_VOLUMES")
     SSH_ENABLED=$(read_config_value "$config_file" "SSH_ENABLED")
     SSH_PORT=$(read_config_value "$config_file" "SSH_PORT")
     SSH_USER=$(read_config_value "$config_file" "SSH_USER")
@@ -93,6 +94,10 @@ validate_loaded_config() {
     fi
     if ! validate_gpus "${GPUS:-$DEFAULT_GPUS}" >/dev/null 2>&1; then
         log_error "Configuration file contains invalid GPUS: ${GPUS:-}"
+        return 1
+    fi
+    if ! validate_extra_volumes_value "${EXTRA_VOLUMES:-}"; then
+        log_error "Configuration file contains invalid EXTRA_VOLUMES: ${EXTRA_VOLUMES:-}"
         return 1
     fi
 }
@@ -311,6 +316,7 @@ CUDA_VARIANT=$CUDA_VARIANT
 UNIQUE_HASH=$UNIQUE_HASH
 ENV_NAME=$ENV_NAME
 GPUS=$GPUS
+EXTRA_VOLUMES=$EXTRA_VOLUMES
 SSH_ENABLED=$SSH_ENABLED
 SSH_PORT=$SSH_PORT
 SSH_USER=$SSH_USER
@@ -427,6 +433,7 @@ PYTHON_VERSION=$PYTHON_VERSION
 IMAGE_NAME=$IMAGE_NAME
 CUDA_VARIANT=$CUDA_VARIANT
 GPUS=$GPUS
+EXTRA_VOLUMES=$EXTRA_VOLUMES
 SSH_ENABLED=$SSH_ENABLED
 SSH_PORT=$SSH_PORT
 SSH_USER=$SSH_USER
@@ -640,6 +647,43 @@ validate_gpus() {
     return 1
 }
 
+validate_volume() {
+    local spec=$1
+
+    if [ -z "$spec" ]; then
+        # 空值用于清空已保存的全部额外卷映射
+        return 0
+    fi
+
+    if ! printf '%s' "$spec" | grep -q ':'; then
+        log_error "Invalid volume mapping: '$spec'"
+        log_error "Use HOST_OR_VOLUME:CONTAINER_PATH[:mode], for example: -v /data:/data"
+        return 1
+    fi
+
+    return 0
+}
+
+validate_extra_volumes_value() {
+    local value=$1
+    local saved_ifs=$IFS
+    local spec
+    IFS='|'
+    local specs=($value)
+    IFS="$saved_ifs"
+
+    for spec in "${specs[@]}"; do
+        [ -n "$spec" ] || continue
+        if ! printf '%s' "$spec" | grep -q ':'; then
+            log_error "Invalid extra volume mapping: '$spec'"
+            log_error "Expected HOST_OR_VOLUME:CONTAINER_PATH[:mode]"
+            return 1
+        fi
+    done
+
+    return 0
+}
+
 ssh_port_in_use() {
     local port=$1
 
@@ -835,6 +879,31 @@ write_docker_compose_file() {
     local container_name="${service_name}-container"
     local selected_gpus="${GPUS:-$DEFAULT_GPUS}"
 
+    # 额外卷映射：优先使用当前进程已加载的 EXTRA_VOLUMES，
+    # 否则回退到项目配置中持久化的值（例如 enter 直接读全局配置时）
+    local config_path="${compose_file%/docker-compose.yml}/config"
+    local extra_volumes="${EXTRA_VOLUMES:-}"
+    if [ -z "$extra_volumes" ] && [ -f "$config_path" ]; then
+        extra_volumes=$(read_config_value "$config_path" "EXTRA_VOLUMES")
+    fi
+
+    local extra_volume_yaml=""
+    if [ -n "$extra_volumes" ]; then
+        local saved_ifs=$IFS
+        local vol_spec
+        local esc
+        IFS='|'
+        local vol_specs=($extra_volumes)
+        IFS="$saved_ifs"
+        for vol_spec in "${vol_specs[@]}"; do
+            [ -n "$vol_spec" ] || continue
+            # 以 YAML 双引号字符串输出，转义反斜杠与引号
+            esc="${vol_spec//\\/\\\\}"
+            esc="${esc//\"/\\\"}"
+            extra_volume_yaml+="      - \"$esc\""$'\n'
+        done
+    fi
+
     cat > "$compose_file" << EOF
 services:
   ${service_name}:
@@ -861,16 +930,9 @@ services:
       - /tmp/.X11-unix:/tmp/.X11-unix
       - /dev/shm:/dev/shm
       - /run/cudo:/run/cudo:ro
-    working_dir: /workspace
+${extra_volume_yaml}    working_dir: /workspace
     stdin_open: true
     tty: true
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
 EOF
 }
 
@@ -1026,6 +1088,12 @@ update_ssh_runtime_config() {
         return 0
     fi
 
+    # 本次请求与上次记录一致（相同端口且未要求新密码）时不重新配置。
+    # 容器内的 SSH 之后仍会由 configure_running_container_ssh 按该配置启动
+    if [ -n "$requested_port" ] && [ "$requested_port" = "$current_port" ] && [ "$password_provided" != "true" ]; then
+        return 0
+    fi
+
     if ! resolve_ssh_port_for_start "$port" "$check_port"; then
         return 1
     fi
@@ -1166,6 +1234,12 @@ update_gpu_runtime_config() {
     local global_config_file="$config_file"
     GPU_PREVIOUS_VALUE=$(read_config_value "$project_config_file" "GPUS")
     GPU_PREVIOUS_VALUE=${GPU_PREVIOUS_VALUE:-$DEFAULT_GPUS}
+
+    # 本次请求与上次记录一致时不重写、不触发重建提示
+    if [ "$requested_gpus" = "$GPU_PREVIOUS_VALUE" ]; then
+        return 0
+    fi
+
     set_config_value "$project_config_file" "GPUS" "$requested_gpus"
     if [ "$global_config_file" = "$project_config_file" ]; then
         global_config_file=$(get_global_config_for_hash "$unique_hash")
@@ -1202,6 +1276,254 @@ rollback_gpu_runtime_config() {
     write_docker_compose_file "$project_path/.cudo/docker-compose.yml" "$image_name" "$unique_hash"
     GPU_RUNTIME_CONFIGURED=false
     log_warning "Restored the previous GPU selection after startup failure"
+}
+
+# 解析一个卷映射，将相对路径按项目根目录解析为绝对路径（与 docker run 语义对齐）
+normalize_volume_spec() {
+    local spec=$1
+    local project_path=$2
+    local host rest
+
+    host="${spec%%:*}"
+    rest="${spec#*:}"
+
+    if [ -z "$host" ]; then
+        # 匿名卷：保持原样
+        printf '%s' "$spec"
+        return 0
+    fi
+
+    case "$host" in
+        /*)
+            # 绝对路径绑定挂载：保持不变
+            ;;
+        */*)
+            # 相对路径（如 ./data、../shared）：相对于项目根目录解析
+            host=$(realpath -m "$project_path/$host")
+            ;;
+        *)
+            # 命名卷（如 mydata:...）：保持不变
+            ;;
+    esac
+
+    printf '%s:%s' "$host" "$rest"
+}
+
+update_volume_runtime_config() {
+    local project_path=$1
+    local image_name=$2
+    local unique_hash=$3
+    local config_file=$4
+
+    # 未提供 --volume：保持已持久化的卷映射不变
+    if [ ${#VOLUME_OPTIONS[@]} -eq 0 ]; then
+        return 0
+    fi
+
+    local project_config_file="$project_path/.cudo/config"
+    local global_config_file="$config_file"
+    VOLUME_PREVIOUS_VALUE=$(read_config_value "$project_config_file" "EXTRA_VOLUMES")
+
+    local new_value=""
+    local spec normalized
+    local parts=()
+    for spec in "${VOLUME_OPTIONS[@]}"; do
+        if [ -n "$spec" ]; then
+            normalized=$(normalize_volume_spec "$spec" "$project_path")
+            parts+=("$normalized")
+        fi
+    done
+    if [ ${#parts[@]} -gt 0 ]; then
+        local saved_ifs=$IFS
+        IFS='|'
+        new_value="${parts[*]}"
+        IFS="$saved_ifs"
+    fi
+
+    if [ "$new_value" = "$VOLUME_PREVIOUS_VALUE" ]; then
+        return 0
+    fi
+
+    if [ -n "$new_value" ]; then
+        set_config_value "$project_config_file" "EXTRA_VOLUMES" "$new_value"
+    else
+        remove_config_value "$project_config_file" "EXTRA_VOLUMES"
+    fi
+    if [ "$global_config_file" = "$project_config_file" ]; then
+        global_config_file=$(get_global_config_for_hash "$unique_hash")
+    fi
+    if [ -n "$global_config_file" ] && [ -f "$global_config_file" ]; then
+        if [ -n "$new_value" ]; then
+            set_config_value "$global_config_file" "EXTRA_VOLUMES" "$new_value"
+        else
+            remove_config_value "$global_config_file" "EXTRA_VOLUMES"
+        fi
+    fi
+
+    EXTRA_VOLUMES="$new_value"
+    write_docker_compose_file "$project_path/.cudo/docker-compose.yml" "$image_name" "$unique_hash"
+    VOLUME_RUNTIME_CONFIGURED=true
+    if [ -n "$new_value" ]; then
+        log_info "Extra volumes configured: ${new_value//|/, }"
+    else
+        log_info "Extra volumes cleared"
+    fi
+}
+
+rollback_volume_runtime_config() {
+    local project_path=$1
+    local image_name=$2
+    local unique_hash=$3
+    local config_file=$4
+
+    if [ "${VOLUME_RUNTIME_CONFIGURED:-false}" != "true" ]; then
+        return 0
+    fi
+
+    local project_config_file="$project_path/.cudo/config"
+    local global_config_file="$config_file"
+    if [ -n "$VOLUME_PREVIOUS_VALUE" ]; then
+        set_config_value "$project_config_file" "EXTRA_VOLUMES" "$VOLUME_PREVIOUS_VALUE"
+    else
+        remove_config_value "$project_config_file" "EXTRA_VOLUMES"
+    fi
+    if [ "$global_config_file" = "$project_config_file" ]; then
+        global_config_file=$(get_global_config_for_hash "$unique_hash")
+    fi
+    if [ -n "$global_config_file" ] && [ -f "$global_config_file" ]; then
+        if [ -n "$VOLUME_PREVIOUS_VALUE" ]; then
+            set_config_value "$global_config_file" "EXTRA_VOLUMES" "$VOLUME_PREVIOUS_VALUE"
+        else
+            remove_config_value "$global_config_file" "EXTRA_VOLUMES"
+        fi
+    fi
+
+    EXTRA_VOLUMES="$VOLUME_PREVIOUS_VALUE"
+    write_docker_compose_file "$project_path/.cudo/docker-compose.yml" "$image_name" "$unique_hash"
+    VOLUME_RUNTIME_CONFIGURED=false
+    log_warning "Restored the previous extra volumes after startup failure"
+}
+
+# 容器已存在且本次显式修改了 GPU/卷设置（需要重建容器）时提示用户确认。
+# 返回 0：同意重建；返回 1：拒绝，按上一次的配置运行。
+# --yes 可跳过确认（适合非交互自动化）。
+confirm_container_recreate() {
+    local container_name=$1
+    local reason=$2
+
+    if [ "${CUDO_YES:-false}" = "true" ]; then
+        return 0
+    fi
+
+    if [ -t 0 ]; then
+        echo
+        log_warning "Container '$container_name' already exists and $reason."
+        log_warning "Applying the new settings recreates the container and discards its writable layer (files inside mounted volumes are kept)."
+        log_warning "You will then be asked whether to commit the current container state before recreating."
+        local answer
+        read -r -p "Recreate the container with the new settings? [y/N] " answer
+        case "$answer" in
+            y|Y|yes|YES|Yes)
+                return 0
+                ;;
+        esac
+    else
+        log_warning "Container '$container_name' exists and $reason, but no terminal is available."
+        log_warning "Keeping the previous environment configuration. Use --yes to apply the new settings and recreate the container."
+    fi
+
+    return 1
+}
+
+# 重建前提示是否先把当前容器状态 commit 到镜像，避免丢失容器内改动。
+# 返回 0：可以继续重建；返回 1：用户中止或 commit 失败（调用方需回滚）。
+prompt_commit_before_recreate() {
+    local container_name=$1
+    local image_name=$2
+
+    if [ "${CUDO_YES:-false}" = "true" ]; then
+        return 0
+    fi
+
+    if [ ! -t 0 ]; then
+        return 0
+    fi
+
+    echo
+    log_warning "Recreating the container discards its writable layer:"
+    log_warning "changes made inside the container (installed packages, files outside mounted volumes, etc.) will be lost."
+    local answer
+    read -r -p "Commit the current container state to image '$image_name' before continuing? [y/N] " answer
+    case "$answer" in
+        y|Y|yes|YES|Yes)
+            local commit_msg="Commit before container recreate at $(date '+%Y-%m-%d %H:%M:%S')"
+            log_info "Committing container $container_name to $image_name..."
+            if docker commit -m "$commit_msg" "$container_name" "$image_name" >/dev/null 2>&1; then
+                log_success "Committed container state to image: $image_name"
+                return 0
+            fi
+            log_error "Commit failed. Aborting the recreate to avoid losing container changes."
+            return 1
+            ;;
+    esac
+
+    log_warning "Proceeding without commit. Container changes will be lost."
+    return 0
+}
+
+# 判断本次是否需要确认重建，并在拒绝时回滚变更、按上一次配置运行。
+# 返回 0：允许重建；返回 1：拒绝（已回滚，后续按旧配置启动/进入）。
+maybe_confirm_recreate() {
+    local project_path=$1
+    local image_name=$2
+    local unique_hash=$3
+    local config_file=$4
+    local container_name=$5
+    local status=$6
+
+    # 容器不存在 → 全新创建，无旧状态可破坏
+    if [ "$status" = "nonexistent" ]; then
+        return 0
+    fi
+
+    # 本次没有显式指定 GPU/卷 → 不触发重建，无需确认
+    if [ -z "$GPU_OPTION" ] && [ ${#VOLUME_OPTIONS[@]} -eq 0 ]; then
+        return 0
+    fi
+
+    # 显式指定的设置与上次记录一致 → 无实际变化，无需确认
+    if [ "${GPU_RUNTIME_CONFIGURED:-false}" != "true" ] && [ "${VOLUME_RUNTIME_CONFIGURED:-false}" != "true" ]; then
+        return 0
+    fi
+
+    local reason=""
+    if [ "${VOLUME_RUNTIME_CONFIGURED:-false}" = "true" ]; then
+        reason="the extra volume mappings were changed"
+    fi
+    if [ "${GPU_RUNTIME_CONFIGURED:-false}" = "true" ]; then
+        if [ -n "$reason" ]; then reason+=" and "; fi
+        reason+="the GPU selection was changed"
+    fi
+    if [ -z "$reason" ]; then
+        reason="GPU/volume settings were specified on the command line"
+    fi
+
+    local approved=false
+    if confirm_container_recreate "$container_name" "$reason"; then
+        if prompt_commit_before_recreate "$container_name" "$image_name"; then
+            approved=true
+        fi
+    fi
+
+    if [ "$approved" = "true" ]; then
+        return 0
+    fi
+
+    # 拒绝重建或 commit 中止：回滚本次 GPU/卷变更，使配置与现有容器保持一致
+    rollback_gpu_runtime_config "$project_path" "$image_name" "$unique_hash" "$config_file"
+    rollback_volume_runtime_config "$project_path" "$image_name" "$unique_hash" "$config_file"
+    log_info "Proceeding with the previous environment configuration for '$container_name'."
+    return 1
 }
 
 configure_running_container_ssh() {
@@ -1812,6 +2134,8 @@ parse_ssh_runtime_options() {
     SSH_OPTION_PASSWORD_FILE=""
     SSH_OPTION_PASSWORD_STDIN=false
     GPU_OPTION=""
+    VOLUME_OPTIONS=()
+    CUDO_YES=false
     RUNTIME_REMAINING_ARGS=()
 
     while [[ $# -gt 0 ]]; do
@@ -1856,6 +2180,21 @@ parse_ssh_runtime_options() {
                 GPU_OPTION="$2"
                 shift 2
                 ;;
+            -v|--volume)
+                if [ $# -lt 2 ]; then
+                    log_error "Missing value for --volume"
+                    exit 1
+                fi
+                if ! validate_volume "$2"; then
+                    exit 1
+                fi
+                VOLUME_OPTIONS+=("$2")
+                shift 2
+                ;;
+            -y|--yes)
+                CUDO_YES=true
+                shift
+                ;;
             *)
                 RUNTIME_REMAINING_ARGS+=("$1")
                 shift
@@ -1887,6 +2226,7 @@ parse_ssh_runtime_options() {
 run_command() {
     parse_ssh_runtime_options "$@"
     GPU_RUNTIME_CONFIGURED=false
+    VOLUME_RUNTIME_CONFIGURED=false
     if [ ${#RUNTIME_REMAINING_ARGS[@]} -gt 0 ]; then
         log_error "Unexpected argument: ${RUNTIME_REMAINING_ARGS[0]}"
         usage
@@ -1925,6 +2265,7 @@ run_command() {
     local status=$(check_container_status "$IMAGE_NAME")
     local container_name="cuda-project-${UNIQUE_HASH}-container"
     update_gpu_runtime_config "$PROJECT_ROOT" "$IMAGE_NAME" "$UNIQUE_HASH" "$CONFIG_FILE" "$GPU_OPTION"
+    update_volume_runtime_config "$PROJECT_ROOT" "$IMAGE_NAME" "$UNIQUE_HASH" "$CONFIG_FILE"
     local check_ssh_port=true
     if [ "$status" = "running" ] && [ -z "$SSH_OPTION_PORT" ]; then
         check_ssh_port=false
@@ -1933,18 +2274,26 @@ run_command() {
     SSH_RUNTIME_CONFIGURED=false
     if ! update_ssh_runtime_config "$PROJECT_ROOT" "$IMAGE_NAME" "$UNIQUE_HASH" "$CONFIG_FILE" "$SSH_OPTION_PORT" "$SSH_OPTION_PASSWORD" "$SSH_OPTION_PASSWORD_PROVIDED" "$check_ssh_port"; then
         rollback_gpu_runtime_config "$PROJECT_ROOT" "$IMAGE_NAME" "$UNIQUE_HASH" "$CONFIG_FILE"
+        rollback_volume_runtime_config "$PROJECT_ROOT" "$IMAGE_NAME" "$UNIQUE_HASH" "$CONFIG_FILE"
         exit 1
+    fi
+
+    local recreate_approved=true
+    if ! maybe_confirm_recreate "$PROJECT_ROOT" "$IMAGE_NAME" "$UNIQUE_HASH" "$CONFIG_FILE" "$container_name" "$status"; then
+        recreate_approved=false
     fi
 
     case $status in
         "running")
             log_info "Entering container..."
-            if [ -n "$GPU_OPTION" ] && ! start_container_ready "$CONFIG_DIR" "$container_name"; then
+            if { [ "${GPU_RUNTIME_CONFIGURED:-false}" = "true" ] || [ "${VOLUME_RUNTIME_CONFIGURED:-false}" = "true" ]; } && [ "$recreate_approved" = "true" ] && ! start_container_ready "$CONFIG_DIR" "$container_name"; then
                 rollback_ssh_runtime_config "$PROJECT_ROOT" "$IMAGE_NAME" "$UNIQUE_HASH" "$CONFIG_FILE"
+                rollback_volume_runtime_config "$PROJECT_ROOT" "$IMAGE_NAME" "$UNIQUE_HASH" "$CONFIG_FILE"
                 exit 1
             fi
             if ! configure_running_container_ssh "$container_name"; then
                 rollback_ssh_runtime_config "$PROJECT_ROOT" "$IMAGE_NAME" "$UNIQUE_HASH" "$CONFIG_FILE"
+                rollback_volume_runtime_config "$PROJECT_ROOT" "$IMAGE_NAME" "$UNIQUE_HASH" "$CONFIG_FILE"
                 exit 1
             fi
             docker exec -it "$container_name" bash
@@ -1953,6 +2302,7 @@ run_command() {
             log_info "Starting container and entering..."
             if ! start_container_ready "$CONFIG_DIR" "$container_name" || ! configure_running_container_ssh "$container_name"; then
                 rollback_ssh_runtime_config "$PROJECT_ROOT" "$IMAGE_NAME" "$UNIQUE_HASH" "$CONFIG_FILE"
+                rollback_volume_runtime_config "$PROJECT_ROOT" "$IMAGE_NAME" "$UNIQUE_HASH" "$CONFIG_FILE"
                 exit 1
             fi
             docker exec -it "$container_name" bash
@@ -1961,6 +2311,7 @@ run_command() {
             log_info "Creating and starting container..."
             if ! start_container_ready "$CONFIG_DIR" "$container_name" || ! configure_running_container_ssh "$container_name"; then
                 rollback_ssh_runtime_config "$PROJECT_ROOT" "$IMAGE_NAME" "$UNIQUE_HASH" "$CONFIG_FILE"
+                rollback_volume_runtime_config "$PROJECT_ROOT" "$IMAGE_NAME" "$UNIQUE_HASH" "$CONFIG_FILE"
                 exit 1
             fi
             docker exec -it "$container_name" bash
@@ -2125,6 +2476,7 @@ ssh_command() {
 start_command() {
     parse_ssh_runtime_options "$@"
     GPU_RUNTIME_CONFIGURED=false
+    VOLUME_RUNTIME_CONFIGURED=false
     if [ ${#RUNTIME_REMAINING_ARGS[@]} -gt 0 ]; then
         log_error "Unexpected argument: ${RUNTIME_REMAINING_ARGS[0]}"
         usage
@@ -2143,6 +2495,7 @@ start_command() {
     local status=$(check_container_status "$IMAGE_NAME")
     local container_name="cuda-project-${UNIQUE_HASH}-container"
     update_gpu_runtime_config "$PROJECT_ROOT" "$IMAGE_NAME" "$UNIQUE_HASH" "$CONFIG_FILE" "$GPU_OPTION"
+    update_volume_runtime_config "$PROJECT_ROOT" "$IMAGE_NAME" "$UNIQUE_HASH" "$CONFIG_FILE"
     local check_ssh_port=true
     if [ "$status" = "running" ] && [ -z "$SSH_OPTION_PORT" ]; then
         check_ssh_port=false
@@ -2151,12 +2504,16 @@ start_command() {
     SSH_RUNTIME_CONFIGURED=false
     if ! update_ssh_runtime_config "$PROJECT_ROOT" "$IMAGE_NAME" "$UNIQUE_HASH" "$CONFIG_FILE" "$SSH_OPTION_PORT" "$SSH_OPTION_PASSWORD" "$SSH_OPTION_PASSWORD_PROVIDED" "$check_ssh_port"; then
         rollback_gpu_runtime_config "$PROJECT_ROOT" "$IMAGE_NAME" "$UNIQUE_HASH" "$CONFIG_FILE"
+        rollback_volume_runtime_config "$PROJECT_ROOT" "$IMAGE_NAME" "$UNIQUE_HASH" "$CONFIG_FILE"
         exit 1
     fi
+
+    maybe_confirm_recreate "$PROJECT_ROOT" "$IMAGE_NAME" "$UNIQUE_HASH" "$CONFIG_FILE" "$container_name" "$status"
 
     log_info "Starting container..."
     if ! start_container_ready "$CONFIG_DIR" "$container_name" || ! configure_running_container_ssh "$container_name"; then
         rollback_ssh_runtime_config "$PROJECT_ROOT" "$IMAGE_NAME" "$UNIQUE_HASH" "$CONFIG_FILE"
+        rollback_volume_runtime_config "$PROJECT_ROOT" "$IMAGE_NAME" "$UNIQUE_HASH" "$CONFIG_FILE"
         exit 1
     fi
 }
@@ -2315,6 +2672,11 @@ config_command() {
         echo "  Image name: $IMAGE_NAME"
         echo "  Environment name: $ENV_NAME"
         echo "  Unique hash: $UNIQUE_HASH"
+        if [ -n "${EXTRA_VOLUMES:-}" ]; then
+            echo "  Extra volumes: ${EXTRA_VOLUMES//|/, }"
+        else
+            echo "  Extra volumes: (none)"
+        fi
         if [ "${SSH_ENABLED:-false}" = "true" ]; then
             echo "  SSH support: enabled"
             echo "  SSH user: $SSH_USER"
@@ -2476,9 +2838,11 @@ enter_global_config() {
 
     local status=$(get_container_status_by_hash "$unique_hash")
     GPU_RUNTIME_CONFIGURED=false
+    VOLUME_RUNTIME_CONFIGURED=false
     GPUS=$(read_config_value "$project_config_dir/config" "GPUS")
     GPUS=${GPUS:-$DEFAULT_GPUS}
     update_gpu_runtime_config "$project_path" "$image_name" "$unique_hash" "$config_file" "$GPU_OPTION"
+    update_volume_runtime_config "$project_path" "$image_name" "$unique_hash" "$config_file"
     local check_ssh_port=true
     if [ "$status" = "running" ] && [ -z "$SSH_OPTION_PORT" ]; then
         check_ssh_port=false
@@ -2487,18 +2851,26 @@ enter_global_config() {
     SSH_RUNTIME_CONFIGURED=false
     if ! update_ssh_runtime_config "$project_path" "$image_name" "$unique_hash" "$config_file" "$SSH_OPTION_PORT" "$SSH_OPTION_PASSWORD" "$SSH_OPTION_PASSWORD_PROVIDED" "$check_ssh_port"; then
         rollback_gpu_runtime_config "$project_path" "$image_name" "$unique_hash" "$config_file"
+        rollback_volume_runtime_config "$project_path" "$image_name" "$unique_hash" "$config_file"
         exit 1
+    fi
+
+    local recreate_approved=true
+    if ! maybe_confirm_recreate "$project_path" "$image_name" "$unique_hash" "$config_file" "$container_name" "$status"; then
+        recreate_approved=false
     fi
 
     case $status in
         "running")
             log_info "Entering environment: $env_name"
-            if [ -n "$GPU_OPTION" ] && ! start_container_ready "$project_config_dir" "$container_name"; then
+            if { [ "${GPU_RUNTIME_CONFIGURED:-false}" = "true" ] || [ "${VOLUME_RUNTIME_CONFIGURED:-false}" = "true" ]; } && [ "$recreate_approved" = "true" ] && ! start_container_ready "$project_config_dir" "$container_name"; then
                 rollback_ssh_runtime_config "$project_path" "$image_name" "$unique_hash" "$config_file"
+                rollback_volume_runtime_config "$project_path" "$image_name" "$unique_hash" "$config_file"
                 exit 1
             fi
             if ! configure_running_container_ssh "$container_name"; then
                 rollback_ssh_runtime_config "$project_path" "$image_name" "$unique_hash" "$config_file"
+                rollback_volume_runtime_config "$project_path" "$image_name" "$unique_hash" "$config_file"
                 exit 1
             fi
             docker_exec_container "$container_name" "$@"
@@ -2507,6 +2879,7 @@ enter_global_config() {
             log_info "Starting environment: $env_name"
             if ! start_container_ready "$project_config_dir" "$container_name" || ! configure_running_container_ssh "$container_name"; then
                 rollback_ssh_runtime_config "$project_path" "$image_name" "$unique_hash" "$config_file"
+                rollback_volume_runtime_config "$project_path" "$image_name" "$unique_hash" "$config_file"
                 exit 1
             fi
             docker_exec_container "$container_name" "$@"
@@ -2523,6 +2896,8 @@ enter_command() {
     SSH_OPTION_PASSWORD_FILE=""
     SSH_OPTION_PASSWORD_STDIN=false
     GPU_OPTION=""
+    VOLUME_OPTIONS=()
+    CUDO_YES=false
 
     if [ $# -gt 0 ]; then
         while [[ $# -gt 0 ]]; do
@@ -2566,6 +2941,21 @@ enter_command() {
                     fi
                     GPU_OPTION="$2"
                     shift 2
+                    ;;
+                -v|--volume)
+                    if [ $# -lt 2 ]; then
+                        log_error "Missing value for --volume"
+                        exit 1
+                    fi
+                    if ! validate_volume "$2"; then
+                        exit 1
+                    fi
+                    VOLUME_OPTIONS+=("$2")
+                    shift 2
+                    ;;
+                -y|--yes)
+                    CUDO_YES=true
+                    shift
                     ;;
                 --)
                     shift
@@ -2878,6 +3268,7 @@ doctor_command() {
         local legacy_ssh_password=$(read_config_value "$CONFIG_FILE" "SSH_PASSWORD_B64")
         local ssh_user=$(read_config_value "$CONFIG_FILE" "SSH_USER")
         local configured_gpus=$(read_config_value "$CONFIG_FILE" "GPUS")
+        local extra_volumes=$(read_config_value "$CONFIG_FILE" "EXTRA_VOLUMES")
 
         doctor_pass "Project config found: $CONFIG_FILE"
 
@@ -2953,6 +3344,15 @@ doctor_command() {
             doctor_pass "GPU selection is valid: $configured_gpus"
         else
             doctor_fail "GPU selection is invalid: $configured_gpus"
+        fi
+        if [ -n "$extra_volumes" ]; then
+            if validate_extra_volumes_value "$extra_volumes" >/dev/null 2>&1; then
+                doctor_pass "Extra volumes are valid: ${extra_volumes//|/, }"
+            else
+                doctor_fail "Extra volumes are invalid: $extra_volumes"
+            fi
+        else
+            doctor_pass "No extra volumes configured"
         fi
     elif [ "$check_all" != "true" ]; then
         doctor_warn "No project config found in current directory"
@@ -3044,6 +3444,13 @@ Runtime SSH options for run/start/enter:
       --ssh-password-file FILE   Read the password from the first line of FILE
       --ssh-password VALUE       Deprecated; exposes the password in process arguments
       --gpus DEVICES             Use all, none, or a device list such as 0,1
+  -v, --volume SPEC     Mount an extra path as HOST_OR_VOLUME:CONTAINER[:mode] (repeatable)
+                           Saved for later runs; pass an empty value to clear them
+  -y, --yes             Apply GPU/volume changes on an existing container without confirmation
+                           When an existing container's settings would change, cudo prompts for
+                           confirmation, then asks whether to commit the container state first
+                           (recreating discards container-local changes); without --yes in a
+                           non-interactive shell it keeps the previous configuration
 
 Doctor options:
       --all              Check every registered Cudo environment
@@ -3060,6 +3467,7 @@ Examples:
   cudo ssh passwd
   printf '%s\n' 'secret' | cudo run --ssh-port 2222 --ssh-password-stdin
   cudo run --gpus 0,1
+  cudo run -v /data/datasets:/datasets -v /mnt/models:/models:ro
   ssh -p 2222 $USER@<host>
   cudo enter train --ssh-port 2223
   cudo enter train -- nvidia-smi

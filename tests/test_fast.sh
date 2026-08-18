@@ -482,6 +482,115 @@ invalid_config_is_rejected() {
     set_config_value "$config_file" "SSH_PORT" ""
 }
 
+repeated_run_with_same_options_is_idempotent() {
+    local config_file="$PROJECT_DIR/.cudo/config"
+    local hash container_name
+    local before after
+
+    hash=$(config_value "$config_file" "UNIQUE_HASH")
+    container_name="cuda-project-${hash}-container"
+
+    cd "$PROJECT_DIR"
+    # 首次运行：容器尚不存在，正常创建并持久化 GPUS
+    cudo_fast run --gpus 0,1 > "$TMP_DIR/idem-gpus-1.out" 2>&1
+    assert_contains "$config_file" '^GPUS=0,1$' || return 1
+
+    # 容器运行中，重复传入相同的 --gpus（带 -y 跳过确认）：无变化时不应触发重建
+    before=$(grep -c 'compose up' "$DOCKER_LOG" || true)
+    CUDO_FAKE_CONTAINER_RUNNING=true CUDO_FAKE_CONTAINER_NAME="$container_name" \
+        cudo_fast run --gpus 0,1 -y > "$TMP_DIR/idem-gpus-2.out" 2>&1
+    after=$(grep -c 'compose up' "$DOCKER_LOG" || true)
+    [ "$after" -eq "$before" ] || {
+        printf 'Re-running with the same --gpus triggered a container recreate\n' >&2
+        return 1
+    }
+
+    # 改变 --gpus 并确认：应触发重建
+    before=$(grep -c 'compose up' "$DOCKER_LOG" || true)
+    CUDO_FAKE_CONTAINER_RUNNING=true CUDO_FAKE_CONTAINER_NAME="$container_name" \
+        cudo_fast run --gpus all -y > "$TMP_DIR/idem-gpus-3.out" 2>&1
+    after=$(grep -c 'compose up' "$DOCKER_LOG" || true)
+    [ "$after" -gt "$before" ] || {
+        printf 'Changing --gpus did not trigger a container recreate\n' >&2
+        return 1
+    }
+    assert_contains "$config_file" '^GPUS=all$' || return 1
+
+    # 恢复基线，避免影响后续用例
+    CUDO_FAKE_CONTAINER_RUNNING=true CUDO_FAKE_CONTAINER_NAME="$container_name" \
+        cudo_fast run --gpus 0,1 -y > "$TMP_DIR/idem-gpus-4.out" 2>&1
+    assert_contains "$config_file" '^GPUS=0,1$' || return 1
+
+    # 全程用 -y 重建时不应自动 docker commit
+    if grep -Eq '^commit ' "$DOCKER_LOG"; then
+        printf 'A --yes recreate unexpectedly committed the container\n' >&2
+        return 1
+    fi
+}
+
+repeated_ssh_port_is_idempotent() {
+    local config_file="$PROJECT_DIR/.cudo/config"
+    local hash container_name
+    local sshd_fake="$FAKE_BIN/ss"
+
+    hash=$(config_value "$config_file" "UNIQUE_HASH")
+    container_name="cuda-project-${hash}-container"
+
+    cd "$PROJECT_DIR"
+    # 首次配置 SSH（端口 2299）
+    printf '%s\n' 'idem-secret' | cudo_fast run --ssh-port 2299 --ssh-password-stdin > "$TMP_DIR/ssh-idem-1.out" 2>&1
+    assert_contains "$config_file" '^SSH_PORT=2299$' || return 1
+
+    # 模拟 2299 已被容器内 sshd 监听
+    cat > "$sshd_fake" <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "-H" ] && [ "${2:-}" = "-ltn" ]; then
+    printf '%s\n' \
+        "State Recv-Q Send-Q Local Address:Port Peer Address:Port Process" \
+        "LISTEN 0      128          0.0.0.0:2299 0.0.0.0:* users:((\"sshd\",pid=1,fd=3))"
+fi
+exit 0
+EOF
+    chmod +x "$sshd_fake"
+
+    # 容器运行中，重复传入相同 --ssh-port：直接跳过，不再报端口被占用
+    if ! CUDO_FAKE_CONTAINER_RUNNING=true CUDO_FAKE_CONTAINER_NAME="$container_name" \
+        cudo_fast run --ssh-port 2299 > "$TMP_DIR/ssh-idem-2.out" 2>&1; then
+        printf 'Re-running with the same --ssh-port failed although nothing changed\n' >&2
+        rm -f "$sshd_fake"
+        return 1
+    fi
+    rm -f "$sshd_fake"
+
+    assert_contains "$config_file" '^SSH_PORT=2299$' || return 1
+}
+
+recreate_prompts_for_commit() {
+    local config_file="$PROJECT_DIR/.cudo/config"
+    local hash container_name
+    local log_yy="$TMP_DIR/commit-yy.log"
+    local log_yn="$TMP_DIR/commit-yn.log"
+
+    hash=$(config_value "$config_file" "UNIQUE_HASH")
+    container_name="cuda-project-${hash}-container"
+
+    cd "$PROJECT_DIR"
+    # 伪终端中：同意重建 (y)，再同意 commit (y) → 重建前应 docker commit
+    : > "$log_yy"
+    printf 'y\ny\n' | script -qec "cd '$PROJECT_DIR' && PATH='$FAKE_BIN:$PATH' CUDO_GLOBAL_CONFIG_DIR='$GLOBAL_DIR' CUDO_FAKE_DOCKER_LOG='$log_yy' CUDO_FAKE_CONTAINER_RUNNING=true CUDO_FAKE_CONTAINER_NAME='$container_name' '$CUDO' run --gpus all" /dev/null > "$TMP_DIR/commit-yy.out" 2>&1
+    assert_contains "$log_yy" '^commit ' || return 1
+    assert_contains "$log_yy" 'compose up' || return 1
+
+    # 伪终端中：同意重建 (y)，拒绝 commit (n) → 不 commit 但继续重建，并给出丢失警告
+    : > "$log_yn"
+    printf 'y\nn\n' | script -qec "cd '$PROJECT_DIR' && PATH='$FAKE_BIN:$PATH' CUDO_GLOBAL_CONFIG_DIR='$GLOBAL_DIR' CUDO_FAKE_DOCKER_LOG='$log_yn' CUDO_FAKE_CONTAINER_RUNNING=true CUDO_FAKE_CONTAINER_NAME='$container_name' '$CUDO' run --gpus 0,1" /dev/null > "$TMP_DIR/commit-yn.out" 2>&1
+    assert_not_contains "$log_yn" '^commit ' || return 1
+    assert_contains "$log_yn" 'compose up' || return 1
+    assert_contains "$TMP_DIR/commit-yn.out" 'will be lost' || return 1
+
+    assert_contains "$config_file" '^GPUS=0,1$' || return 1
+}
+
 legacy_rollback_restores_global_password() {
     local config_file="$LEGACY_PROJECT_DIR/.cudo/config"
     local global_config
@@ -523,6 +632,9 @@ main() {
     test_case "doctor supports all environments and JSON" doctor_json_and_all_work
     test_case "failed startup rolls back SSH configuration" failed_start_rolls_back_ssh_config
     test_case "invalid configuration is rejected" invalid_config_is_rejected
+    test_case "repeated run with same options is idempotent" repeated_run_with_same_options_is_idempotent
+    test_case "repeated run with same SSH port is idempotent" repeated_ssh_port_is_idempotent
+    test_case "recreate prompts to commit before discarding container state" recreate_prompts_for_commit
     test_case "legacy rollback restores global password" legacy_rollback_restores_global_password
 
     printf '\nFast test summary: %s passed, %s failed\n' "$PASS_COUNT" "$FAIL_COUNT"

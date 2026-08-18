@@ -17,6 +17,7 @@ A powerful command-line tool for managing CUDA development environments using Do
 - **Docker Integration**: Seamless integration with Docker and Docker Compose
 - **Runtime SSH Access**: Password-authenticated SSH with no default listening port
 - **GPU Selection**: Select all, no, or specific GPUs when starting an environment
+- **Extra Volume Mounting**: Mount additional host paths or named volumes like `docker run -v`
 - **Container GPU Process View**: Use `cudo-smi` with container-local PIDs without exposing host processes
 - **Diagnostics and CI**: Built-in health checks plus automated fast tests
 
@@ -174,6 +175,43 @@ cudo remove
 
 `--gpus` accepts `all`, `none`, or comma-separated numeric device IDs such as `0,1`. It is supported by `run`, `start`, and `enter`. Changing it for a running environment recreates the container with the new visibility setting while preserving the project volume.
 
+### Extra Volume Mounting
+
+`run`, `start`, and `enter` accept `-v`/`--volume` the same way as `docker run -v`. Each spec mounts a host path or a named volume into the container; the default project workspace mount is always preserved.
+
+```bash
+# Mount host paths (read-write and read-only)
+cudo run -v /data/datasets:/datasets -v /mnt/models:/models:ro
+
+# Relative host paths are resolved against the project root
+cudo run -v ./logs:/logs
+
+# Named volumes work too
+cudo run -v my-weights:/workspace/weights
+
+# Mount with an already running environment
+cudo start -v /data:/data
+cudo enter train -v /data:/data
+```
+
+Extra volumes are saved in the project configuration, so later `cudo run`, `start`, and `enter` reuse them. Passing `--volume` replaces the saved list — give all mounts you want in a single command. Pass an empty value to clear the saved mounts:
+
+```bash
+# Replace the saved mounts with a new set
+cudo run -v /new/a:/a -v /new/b:/b
+
+# Remove all saved extra mounts
+cudo run -v ""
+```
+
+Changing the mount set (or the GPU selection) for an environment whose container already exists recreates the container, while preserving the project workspace mount. Because recreation discards the container's writable layer, Cudo asks for confirmation first:
+
+- In an interactive terminal, Cudo prompts `Recreate the container with the new settings? [y/N]`. Answering `n` keeps the previous configuration and runs the existing container as-is.
+- In a non-interactive shell (no terminal), Cudo keeps the previous configuration and warns, instead of silently recreating.
+- Pass `-y`/`--yes` to skip the prompt and apply the new settings unconditionally (useful for automation).
+
+Freshly created environments (no container yet) never prompt, and a plain `cudo run`/`enter`/`start` with no setting change does not prompt either.
+
 ### GPU Process View
 
 Run `cudo-smi` inside a Cudo container to list only GPU processes owned by that container. The displayed PID is the container PID, so it can be used directly with container tools such as `ps` and `kill`.
@@ -309,6 +347,8 @@ These options apply to `run`, `start`, and `enter`.
 | `--ssh-password-file FILE` | Read the first line of a password file | unset |
 | `--ssh-password VALUE` | Deprecated plaintext argument | unset |
 | `--gpus` | Visible GPUs: `all`, `none`, or device IDs such as `0,1` | all |
+| `-v, --volume SPEC` | Extra mount like `docker run -v`: `HOST_OR_VOLUME:CONTAINER[:mode]` (repeatable) | unset |
+| `-y, --yes` | Apply GPU/volume changes on an existing container without confirmation | unset |
 
 ### SSH Subcommands
 
@@ -352,7 +392,7 @@ Statistics:
 
 1. **Docker Image Building**: Generates optimized Dockerfile with CUDA support
 2. **Container Orchestration**: Uses Docker Compose for lifecycle management
-3. **Volume Mounting**: Maps project directories into containers
+3. **Volume Mounting**: Maps project directories and user-configured extra mounts into containers
 4. **GPU Access**: Persists GPU visibility and configures the NVIDIA runtime
 5. **Global Tracking**: Stores project metadata in `/var/lib/cudo-global/`
 6. **Resource Monitoring**: Integrates with Docker stats and NVIDIA tools
