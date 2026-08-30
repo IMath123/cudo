@@ -1927,6 +1927,11 @@ build_command() {
     local existing_ssh_password_hash_b64=""
     local existing_ssh_password_b64=""
     local existing_gpus="$DEFAULT_GPUS"
+    local existing_cuda_version=""
+    local existing_ubuntu_version=""
+    local existing_with_toolkit=""
+    local existing_python_version=""
+    local existing_image_name=""
     if [ -f "$CONFIG_FILE" ]; then
         load_config_values "$CONFIG_FILE"
         GPUS=${GPUS:-$DEFAULT_GPUS}
@@ -1943,14 +1948,22 @@ build_command() {
         existing_ssh_password_hash_b64="${SSH_PASSWORD_HASH_B64:-}"
         existing_ssh_password_b64="${SSH_PASSWORD_B64:-}"
         existing_gpus="${GPUS:-$DEFAULT_GPUS}"
+        existing_cuda_version="${CUDA_VERSION:-}"
+        existing_ubuntu_version="${UBUNTU_VERSION:-}"
+        existing_with_toolkit="${WITH_TOOLKIT:-}"
+        existing_python_version="${PYTHON_VERSION:-}"
+        existing_image_name="${IMAGE_NAME:-}"
     fi
 
-    # 解析构建参数
-    local cuda_version=$DEFAULT_CUDA_VERSION
-    local ubuntu_version=$DEFAULT_UBUNTU_VERSION
-    local with_toolkit=$DEFAULT_WITH_TOOLKIT
-    local python_version=$DEFAULT_PYTHON_VERSION
+    # 无参数重建时沿用已有环境的构建配置，避免意外改变 CUDA 变体并使缓存失效。
+    local cuda_version="${existing_cuda_version:-$DEFAULT_CUDA_VERSION}"
+    local ubuntu_version="${existing_ubuntu_version:-$DEFAULT_UBUNTU_VERSION}"
+    local with_toolkit="${existing_with_toolkit:-$DEFAULT_WITH_TOOLKIT}"
+    local python_version="${existing_python_version:-$DEFAULT_PYTHON_VERSION}"
     local image_name_base=$DEFAULT_IMAGE_NAME_BASE
+    if [ -n "$existing_image_name" ] && [ -n "$existing_hash" ]; then
+        image_name_base="${existing_image_name%-${existing_hash}}"
+    fi
     local requested_env_name=""
     local explicit_env_name=false
 
@@ -2224,6 +2237,8 @@ parse_ssh_runtime_options() {
 
 # 运行命令（进入容器）
 run_command() {
+    local exec_args=("${CUDO_EXEC_ARGS[@]}")
+
     parse_ssh_runtime_options "$@"
     GPU_RUNTIME_CONFIGURED=false
     VOLUME_RUNTIME_CONFIGURED=false
@@ -2296,7 +2311,7 @@ run_command() {
                 rollback_volume_runtime_config "$PROJECT_ROOT" "$IMAGE_NAME" "$UNIQUE_HASH" "$CONFIG_FILE"
                 exit 1
             fi
-            docker exec -it "$container_name" bash
+            docker_exec_container "$container_name" "${exec_args[@]}"
             ;;
         "stopped")
             log_info "Starting container and entering..."
@@ -2305,7 +2320,7 @@ run_command() {
                 rollback_volume_runtime_config "$PROJECT_ROOT" "$IMAGE_NAME" "$UNIQUE_HASH" "$CONFIG_FILE"
                 exit 1
             fi
-            docker exec -it "$container_name" bash
+            docker_exec_container "$container_name" "${exec_args[@]}"
             ;;
         "nonexistent")
             log_info "Creating and starting container..."
@@ -2314,9 +2329,92 @@ run_command() {
                 rollback_volume_runtime_config "$PROJECT_ROOT" "$IMAGE_NAME" "$UNIQUE_HASH" "$CONFIG_FILE"
                 exit 1
             fi
-            docker exec -it "$container_name" bash
+            docker_exec_container "$container_name" "${exec_args[@]}"
             ;;
     esac
+}
+
+# 在当前项目或指定环境中执行命令。
+# 指定环境名或运行时选项时，命令放在 -- 之后以消除歧义。
+exec_command() {
+    local prefix_args=()
+    local command_args=()
+    local target_name=""
+    local parsing_command=false
+    local arg
+    local has_separator=false
+
+    if [ $# -eq 0 ]; then
+        log_error "Usage: cudo exec <command> [args...]"
+        log_error "   or: cudo exec [environment] [runtime options] -- <command> [args...]"
+        exit 1
+    fi
+
+    # 没有分隔符时，所有参数都是当前项目环境中的命令。例如：cudo exec nvidia-smi。
+    # 指定环境名或运行时选项时使用 -- 消除歧义。
+    for arg in "$@"; do
+        if [ "$arg" = "--" ]; then
+            has_separator=true
+            break
+        fi
+    done
+    if [ "$has_separator" = "false" ]; then
+        CUDO_EXEC_ARGS=("$@")
+        run_command
+        return
+    fi
+
+    while [ $# -gt 0 ]; do
+        if [ "$parsing_command" = "true" ]; then
+            command_args+=("$1")
+            shift
+            continue
+        fi
+
+        if [ "$1" = "--" ]; then
+            parsing_command=true
+            shift
+            continue
+        fi
+
+        prefix_args+=("$1")
+        case "$1" in
+            --ssh-port|--ssh-password|--ssh-password-file|--gpus|-v|--volume)
+                if [ $# -lt 2 ]; then
+                    log_error "Missing value for $1"
+                    exit 1
+                fi
+                prefix_args+=("$2")
+                shift 2
+                ;;
+            --ssh-password-stdin|-y|--yes)
+                shift
+                ;;
+            *)
+                if [ -z "$target_name" ]; then
+                    target_name="$1"
+                    shift
+                else
+                    log_error "Unexpected argument: $1"
+                    log_error "Use: cudo exec [environment] [runtime options] -- <command> [args...]"
+                    exit 1
+                fi
+                ;;
+        esac
+    done
+
+    if [ "$parsing_command" != "true" ] || [ ${#command_args[@]} -eq 0 ]; then
+        log_error "A command is required after '--'"
+        log_error "Use: cudo exec [environment] [runtime options] -- <command> [args...]"
+        exit 1
+    fi
+
+    if [ -n "$target_name" ]; then
+        enter_command "${prefix_args[@]}" -- "${command_args[@]}"
+    else
+        CUDO_EXEC_ARGS=("${command_args[@]}")
+        run_command "${prefix_args[@]}"
+    fi
 }
 
 # 状态命令
@@ -3413,6 +3511,7 @@ Usage: cudo <command> [options]
 Commands:
   build [options]    Build CUDA environment image
   run                Start and enter container
+  exec [env] -- CMD  Run a command in the current or named environment
   enter [name]       Enter a Cudo environment from any directory
   rename <old> <new> Rename a Cudo environment
   status             Check container status
@@ -3468,6 +3567,9 @@ Examples:
   printf '%s\n' 'secret' | cudo run --ssh-port 2222 --ssh-password-stdin
   cudo run --gpus 0,1
   cudo run -v /data/datasets:/datasets -v /mnt/models:/models:ro
+  cudo exec nvidia-smi
+  cudo exec -- nvidia-smi
+  cudo exec train -- python train.py --epochs 10
   ssh -p 2222 $USER@<host>
   cudo enter train --ssh-port 2223
   cudo enter train -- nvidia-smi
@@ -3541,7 +3643,7 @@ main() {
             status_command "$@"
             ;;
         "exec")
-            run_command "$@"
+            exec_command "$@"
             ;;
         "config")
             config_command

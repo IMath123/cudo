@@ -142,6 +142,15 @@ cudo enter
 # Run a command inside a named environment
 cudo enter train -- nvidia-smi
 
+# Run a command in the current project's environment
+cudo exec nvidia-smi
+
+# `--` also makes the command boundary explicit
+cudo exec -- nvidia-smi
+
+# Run a command in a named environment from any directory
+cudo exec train -- python train.py --epochs 10
+
 # Rename a Cudo environment
 cudo rename train training
 

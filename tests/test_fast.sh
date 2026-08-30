@@ -295,6 +295,20 @@ build_has_no_default_ssh_port() {
     assert_contains "$TMP_DIR/list-no-ssh.out" '[[:space:]]-[[:space:]]'
 }
 
+rebuild_preserves_existing_build_configuration() {
+    local config_file="$PROJECT_DIR/.cudo/config"
+
+    cd "$PROJECT_DIR"
+    cudo_fast build -t -c 12.4.0 -u 20.04 -p 3.10 > "$TMP_DIR/build-devel.out"
+    cudo_fast build > "$TMP_DIR/rebuild-preserve.out"
+
+    assert_contains "$config_file" '^CUDA_VERSION=12.4.0$' || return 1
+    assert_contains "$config_file" '^UBUNTU_VERSION=20.04$' || return 1
+    assert_contains "$config_file" '^WITH_TOOLKIT=true$' || return 1
+    assert_contains "$config_file" '^CUDA_VARIANT=devel$' || return 1
+    assert_contains "$config_file" '^PYTHON_VERSION=3.10$'
+}
+
 upgrade_command_is_disabled() {
     if cudo_fast upgrade fast > "$TMP_DIR/upgrade-disabled.out" 2>&1; then
         printf 'Expected cudo upgrade to be rejected\n' >&2
@@ -338,6 +352,24 @@ run_and_enter_can_update_ssh_port() {
 
     cudo_fast enter fast --ssh-port 2224 -- true > "$TMP_DIR/enter-ssh.out"
     assert_contains "$config_file" '^SSH_PORT=2224$'
+}
+
+exec_runs_in_current_or_named_environment() {
+    local config_file="$PROJECT_DIR/.cudo/config"
+    local hash container_name
+
+    hash=$(config_value "$config_file" "UNIQUE_HASH")
+    container_name="cuda-project-${hash}-container"
+    : > "$DOCKER_LOG"
+
+    cd "$PROJECT_DIR"
+    cudo_fast exec nvidia-smi > "$TMP_DIR/exec-current.out"
+    assert_contains "$DOCKER_LOG" "^exec -i ${container_name} nvidia-smi$" || return 1
+
+    : > "$DOCKER_LOG"
+    cd "$TMP_DIR"
+    cudo_fast exec fast -- nvidia-smi > "$TMP_DIR/exec-named.out"
+    assert_contains "$DOCKER_LOG" "^exec -i ${container_name} nvidia-smi$"
 }
 
 list_shows_configured_ssh_port() {
@@ -619,9 +651,11 @@ main() {
     test_case "GPU agent and client unit tests" gpu_tool_unit_tests
     test_case "doctor is read-only without global config dir" doctor_is_read_only_without_global_dir
     test_case "build has no default SSH port" build_has_no_default_ssh_port
+    test_case "rebuild preserves existing build configuration" rebuild_preserves_existing_build_configuration
     test_case "upgrade command is disabled" upgrade_command_is_disabled
     test_case "runtime SSH password is stored as a hash" runtime_password_is_hashed
     test_case "run and enter can update SSH port" run_and_enter_can_update_ssh_port
+    test_case "exec runs commands in current or named environments" exec_runs_in_current_or_named_environment
     test_case "list shows configured SSH port" list_shows_configured_ssh_port
     test_case "legacy SSH_PASSWORD_B64 migrates to hash" legacy_password_b64_migrates_to_hash
     test_case "doctor reports hashed SSH password" doctor_reports_hashed_project_password
