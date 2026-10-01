@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Cudo - CUDA Development Environment Manager Installation Script
-# This script installs cudo system-wide
+# Installs system-wide as root, or for the current user otherwise.
 
 set -e
 
@@ -16,12 +16,6 @@ log_info() { echo -e "${BLUE}$1${NC}"; }
 log_success() { echo -e "${GREEN} $1${NC}"; }
 log_warning() { echo -e "${YELLOW}$1${NC}"; }
 log_error() { echo -e "${RED}$1${NC}"; }
-
-# Check if running as root
-if [ "$EUID" -eq 0 ]; then
-    log_error "Please do not run this script as root"
-    exit 1
-fi
 
 # Check OS
 if [[ "$OSTYPE" == "darwin"* ]]; then
@@ -103,7 +97,9 @@ check_dependencies() {
     local missing=()
     
     if ! command -v docker &> /dev/null; then
-        if ! install_docker; then
+        if [ "$EUID" -ne 0 ]; then
+            log_warning "Docker is missing; ask your administrator to install it before using cudo."
+        elif ! install_docker; then
             log_error "Docker is required but could not be installed."
             return 1
         fi
@@ -123,7 +119,9 @@ check_dependencies() {
     # Simple check: look for nvidia-container-runtime or try to run a test container?
     # Better: check if /etc/docker/daemon.json contains nvidia runtime or check packages
     if ! dpkg -l | grep -q nvidia-docker2 && ! dpkg -l | grep -q nvidia-container-toolkit; then
-         if ! install_nvidia_docker; then
+         if [ "$EUID" -ne 0 ]; then
+            log_warning "NVIDIA Container Toolkit is missing; ask your administrator to install it for GPU support."
+         elif ! install_nvidia_docker; then
             log_error "NVIDIA Docker is required for GPU support but could not be installed."
             return 1
          fi
@@ -156,49 +154,70 @@ check_dependencies() {
     return 0
 }
 
-# Install system-wide
-install_system_wide() {
-    local install_dir="/usr/local/bin"
-    local script_name="cudo"
-    
-    log_info "Installing to $install_dir..."
-    
-    # Copy main script
-    sudo cp "$PROJECT_ROOT/cudo" "$install_dir/$script_name"
-    sudo chmod +x "$install_dir/$script_name"
-    
-    # Create scripts directory
-    local scripts_dir="/usr/local/share/cudo"
-    sudo mkdir -p "$scripts_dir"
-    sudo cp "$PROJECT_ROOT/scripts/cuda-env-list-simple.py" "$scripts_dir/"
-    sudo cp "$PROJECT_ROOT/scripts/cudo-smi.py" "$scripts_dir/"
-    sudo cp "$PROJECT_ROOT/scripts/nvidia-smi" "$scripts_dir/"
-    sudo chmod 755 "$scripts_dir/cudo-smi.py" "$scripts_dir/nvidia-smi"
-
-    # Install the host-side GPU process agent.
-    sudo mkdir -p /usr/local/libexec
-    sudo cp "$PROJECT_ROOT/scripts/cudo-gpu-agent.py" /usr/local/libexec/cudo-gpu-agent
-    sudo chmod 755 /usr/local/libexec/cudo-gpu-agent
-    if command -v systemctl >/dev/null 2>&1; then
-        sudo cp "$PROJECT_ROOT/scripts/cudo-gpu-agent.service" /etc/systemd/system/cudo-gpu-agent.service
-        sudo systemctl daemon-reload
-        sudo systemctl enable --now cudo-gpu-agent.service
+# Install using the privileges of the current process; never invoke sudo.
+install_cudo() {
+    local install_dir scripts_dir global_config_dir
+    if [ "$EUID" -eq 0 ]; then
+        install_dir="/usr/local/bin"
+        scripts_dir="/usr/local/share/cudo"
+        global_config_dir="/var/lib/cudo-global"
     else
-        log_warning "systemd was not found; start /usr/local/libexec/cudo-gpu-agent manually"
+        install_dir="$HOME/.local/bin"
+        scripts_dir="$HOME/.local/share/cudo"
+        global_config_dir="$HOME/.local/share/cudo-global"
     fi
-    
-    # Update script path in main script
-    sudo sed -i "s|SCRIPT_DIR=.*|SCRIPT_DIR=\"$scripts_dir\"|" "$install_dir/$script_name"
-    
-    # Create global configuration directory
-    local global_config_dir="/var/lib/cudo-global"
-    sudo mkdir -p "$global_config_dir"
-    sudo chmod 777 "$global_config_dir"
-    
-    log_success "Installed $script_name to $install_dir"
+
+    log_info "Installing to $install_dir..."
+    mkdir -p "$install_dir" "$scripts_dir" "$global_config_dir"
+    cp "$PROJECT_ROOT/cudo" "$install_dir/cudo"
+    chmod 755 "$install_dir/cudo"
+    cp "$PROJECT_ROOT/scripts/cuda-env-list-simple.py" "$scripts_dir/"
+    cp "$PROJECT_ROOT/scripts/cudo-smi.py" "$scripts_dir/"
+    cp "$PROJECT_ROOT/scripts/nvidia-smi" "$scripts_dir/"
+    chmod 755 "$scripts_dir/cudo-smi.py" "$scripts_dir/nvidia-smi"
+
+    # Quote paths as shell literals, including homes containing spaces or quotes.
+    python3 - "$install_dir/cudo" "$scripts_dir" "$global_config_dir" <<'PYTHON'
+import pathlib
+import shlex
+import sys
+
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+lines = text.splitlines(keepends=True)
+for index, line in enumerate(lines):
+    if line.startswith('SCRIPT_DIR='):
+        lines[index] = 'SCRIPT_DIR=' + shlex.quote(sys.argv[2]) + '\n'
+    elif line.startswith('GLOBAL_CONFIG_DIR='):
+        lines[index] = ('GLOBAL_CONFIG_DIR=${CUDO_GLOBAL_CONFIG_DIR:-'
+                        + shlex.quote(sys.argv[3]) + '}\n')
+path.write_text(''.join(lines))
+PYTHON
+
+    if [ "$EUID" -eq 0 ]; then
+        chmod 777 "$global_config_dir"
+        mkdir -p /usr/local/libexec
+        cp "$PROJECT_ROOT/scripts/cudo-gpu-agent.py" /usr/local/libexec/cudo-gpu-agent
+        chmod 755 /usr/local/libexec/cudo-gpu-agent
+        if command -v systemctl >/dev/null 2>&1; then
+            cp "$PROJECT_ROOT/scripts/cudo-gpu-agent.service" /etc/systemd/system/cudo-gpu-agent.service
+            systemctl daemon-reload
+            systemctl enable --now cudo-gpu-agent.service
+        else
+            log_warning "systemd was not found; start /usr/local/libexec/cudo-gpu-agent manually"
+        fi
+        log_success "GPU process agent installed"
+    else
+        log_warning "The system GPU process agent requires an administrator to install it with sudo bash ./install.sh."
+        case ":$PATH:" in
+            *":$install_dir:"*) ;;
+            *) log_warning 'Add ~/.local/bin to PATH in your shell configuration: export PATH="$HOME/.local/bin:$PATH"' ;;
+        esac
+    fi
+
+    log_success "Installed cudo to $install_dir"
     log_success "Support files installed to $scripts_dir"
-    log_success "Global configuration directory created: $global_config_dir"
-    log_success "GPU process agent installed"
+    log_success "Project registry directory created: $global_config_dir"
 }
 
 # Main installation
@@ -211,7 +230,7 @@ main() {
         exit 1
     fi
     
-    install_system_wide
+    install_cudo
     
     echo
     log_success "Installation completed successfully!"

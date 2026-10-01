@@ -9,8 +9,12 @@
 git clone https://github.com/IMath123/cudo.git
 cd cudo
 
-# Run the installation script (requires sudo)
-./install.sh
+# Install for the current user (no sudo)
+bash ./install.sh
+export PATH="$HOME/.local/bin:$PATH"
+
+# Or install system-wide, including the GPU process agent
+sudo bash ./install.sh
 
 # Test the installation
 cudo --help
@@ -19,7 +23,13 @@ cudo doctor
 
 ## File Structure After Installation
 
-After installation, the file structure should look like this:
+A user installation stores the executable in `~/.local/bin`, support files in
+`~/.local/share/cudo`, and the project registry in `~/.local/share/cudo-global`.
+Add `~/.local/bin` to your shell configuration if it is not already on `PATH`.
+User installation does not install system dependencies or the GPU agent service;
+an administrator must provide those. The GPU process view requires that service.
+
+After a system-wide installation, the file structure should look like this:
 
 ```
 /usr/local/bin/cudo                  # Main executable
@@ -52,7 +62,7 @@ If you see an error like "Python list script not found", check:
    sudo rm -f /usr/local/bin/cudo
    sudo rm -rf /usr/local/share/cudo
    sudo rm -rf /var/lib/cudo-global
-   ./install.sh
+   sudo bash ./install.sh
    ```
 
 ### PATH Issues
@@ -63,8 +73,9 @@ If `cudo` command is not found:
 # Check if /usr/local/bin is in PATH
 echo $PATH | grep -q "/usr/local/bin" && echo "PATH is correct" || echo "PATH needs update"
 
-# Add to PATH temporarily
-export PATH="/usr/local/bin:$PATH"
+# Add the appropriate directory to PATH temporarily
+export PATH="$HOME/.local/bin:$PATH"  # User installation
+export PATH="/usr/local/bin:$PATH"    # System-wide installation
 ```
 
 ## Verification
@@ -118,6 +129,17 @@ cudo doctor
 `cudo doctor` returns a non-zero exit code when a required check fails. Warnings, such as an environment that has not created its container yet, do not make the command fail.
 
 ## Uninstallation
+
+For a user installation:
+
+```bash
+rm -f "$HOME/.local/bin/cudo"
+rm -rf "$HOME/.local/share/cudo"
+# Remove the project registry only if you no longer need its metadata
+rm -rf "$HOME/.local/share/cudo-global"
+```
+
+For a system-wide installation:
 
 ```bash
 sudo rm -f /usr/local/bin/cudo

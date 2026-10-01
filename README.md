@@ -71,6 +71,15 @@ cudo run
 
 For detailed installation instructions, please see the [INSTALL.md](INSTALL.md) file.
 
+```bash
+bash ./install.sh       # Install to ~/.local/bin
+sudo bash ./install.sh  # Install to /usr/local/bin
+```
+
+User installations keep support files and project metadata under `~/.local/share`.
+Add `~/.local/bin` to `PATH` if needed. System dependencies and the GPU process
+agent service require administrator setup.
+
 ### One-Line Installation
 ```bash
 # Install with a single command
