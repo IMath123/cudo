@@ -85,6 +85,7 @@ prepare_integration_environment() {
 }
 
 run_fast_tests() {
+    run_suite "permissions" python3 "$SCRIPT_DIR/test_permissions.py"
     run_suite "fast" bash "$SCRIPT_DIR/test_fast.sh"
 }
 

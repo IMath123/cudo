@@ -16,9 +16,12 @@ jobs:
       - name: Install test dependencies
         run: sudo apt-get update && sudo apt-get install -y gettext shellcheck
       - name: Check shell scripts
-        run: shellcheck --severity=error cudo tests/*.sh
+        run: shellcheck --severity=error cudo install.sh get-cudo.sh tests/*.sh
       - name: Run fast tests
         run: ./tests/run_all_tests.sh
+
+      - name: Multi-user permission tests (real UIDs, staged installation)
+        run: sudo env CUDO_REQUIRE_MULTIUSER_TESTS=1 /usr/bin/python3 tests/test_permissions.py
 
   integration:
     if: github.event_name == 'workflow_dispatch'

@@ -242,7 +242,7 @@ syntax_checks() {
     python3 -m py_compile "$ROOT_DIR/scripts/cuda-env-list-simple.py"
     python3 -m py_compile "$ROOT_DIR/scripts/cudo-gpu-agent.py" "$ROOT_DIR/scripts/cudo-smi.py" "$ROOT_DIR/scripts/nvidia-smi" "$SCRIPT_DIR/test_gpu_tools.py"
     if command -v shellcheck >/dev/null 2>&1; then
-        shellcheck "$CUDO" "$SCRIPT_DIR"/*.sh
+        shellcheck --severity=error "$CUDO" "$ROOT_DIR/install.sh" "$ROOT_DIR/get-cudo.sh" "$SCRIPT_DIR"/*.sh
     fi
 }
 
@@ -273,12 +273,14 @@ gpu_tool_unit_tests() {
 
 build_has_no_default_ssh_port() {
     mkdir -p "$GLOBAL_DIR" "$PROJECT_DIR"
+    chmod 700 "$GLOBAL_DIR"
 
     cd "$PROJECT_DIR"
     cudo_fast build --name fast -c 12.4 -p 3.10 > "$TMP_DIR/build.out"
 
     local config_file="$PROJECT_DIR/.cudo/config"
     assert_file_exists "$config_file"
+    [ "$(stat -c %a "$config_file")" = 600 ] || return 1
     assert_contains "$config_file" '^SSH_ENABLED=true$'
     assert_contains "$config_file" '^SSH_PORT=$'
     assert_contains "$config_file" '^SSH_PASSWORD_HASH_B64=$'
@@ -485,7 +487,7 @@ doctor_json_and_all_work() {
     set_config_value "$global_config" "ENV_NAME" $'fast\tjson'
     cd "$PROJECT_DIR"
     cudo_fast doctor --all --json > "$TMP_DIR/doctor.json"
-    python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert "checks" in d and isinstance(d["checks"], list)' "$TMP_DIR/doctor.json"
+    python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert "checks" in d and isinstance(d["checks"], list)' "$TMP_DIR/doctor.json" || return 1
     set_config_value "$global_config" "ENV_NAME" "fast"
 }
 

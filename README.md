@@ -524,3 +524,8 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ---
 
 **Made with ❤️ for the CUDA development community using Docker containers**
+
+System-wide installation shares executable code only. Project registries are private
+to each invoking user (0700), including when using `/usr/local/bin/cudo`. See
+[installation and migration](INSTALL.md#multi-user-security-and-migration) before upgrading
+from the legacy shared `/var/lib/cudo-global` registry.

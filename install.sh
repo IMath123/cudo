@@ -4,6 +4,7 @@
 # Installs system-wide as root, or for the current user otherwise.
 
 set -e
+umask 022
 
 # Colors for output
 RED='\033[0;31m'
@@ -43,11 +44,7 @@ install_docker() {
 
     if curl -fsSL https://get.docker.com | sh; then
         log_success "Docker installed successfully."
-        # Add current user to docker group if sudo is available
-        if [ -n "$SUDO_USER" ]; then
-            usermod -aG docker "$SUDO_USER"
-            log_info "Added user $SUDO_USER to docker group."
-        fi
+        log_warning "Docker socket access grants root-equivalent privileges; configure user access separately."
         systemctl start docker
         systemctl enable docker
         return 0
@@ -156,28 +153,39 @@ check_dependencies() {
 
 # Install using the privileges of the current process; never invoke sudo.
 install_cudo() {
-    local install_dir scripts_dir global_config_dir
+    local install_dir scripts_dir
     if [ "$EUID" -eq 0 ]; then
         install_dir="/usr/local/bin"
         scripts_dir="/usr/local/share/cudo"
-        global_config_dir="/var/lib/cudo-global"
     else
         install_dir="$HOME/.local/bin"
         scripts_dir="$HOME/.local/share/cudo"
-        global_config_dir="$HOME/.local/share/cudo-global"
     fi
 
     log_info "Installing to $install_dir..."
-    mkdir -p "$install_dir" "$scripts_dir" "$global_config_dir"
+    # Validate all destinations before copying; never follow an existing
+    # symlink/hardlink or install through a directory another user can write.
+    local target
+    for target in "$install_dir/cudo" "$scripts_dir/cuda-env-list-simple.py" \
+        "$scripts_dir/cudo-smi.py" "$scripts_dir/nvidia-smi" "$scripts_dir/cudo_paths.py"; do
+        python3 "$PROJECT_ROOT/scripts/cudo_paths.py" --install-target "$target"
+    done
+    if [ "$EUID" -eq 0 ]; then
+        python3 "$PROJECT_ROOT/scripts/cudo_paths.py" --install-target /usr/local/libexec/cudo-gpu-agent
+        python3 "$PROJECT_ROOT/scripts/cudo_paths.py" --install-target /etc/systemd/system/cudo-gpu-agent.service
+    fi
+    chmod 755 "$install_dir" "$scripts_dir"
     cp "$PROJECT_ROOT/cudo" "$install_dir/cudo"
     chmod 755 "$install_dir/cudo"
+    cp "$PROJECT_ROOT/scripts/cudo_paths.py" "$scripts_dir/"
     cp "$PROJECT_ROOT/scripts/cuda-env-list-simple.py" "$scripts_dir/"
     cp "$PROJECT_ROOT/scripts/cudo-smi.py" "$scripts_dir/"
     cp "$PROJECT_ROOT/scripts/nvidia-smi" "$scripts_dir/"
+    chmod 644 "$scripts_dir/cudo_paths.py" "$scripts_dir/cuda-env-list-simple.py"
     chmod 755 "$scripts_dir/cudo-smi.py" "$scripts_dir/nvidia-smi"
 
     # Quote paths as shell literals, including homes containing spaces or quotes.
-    python3 - "$install_dir/cudo" "$scripts_dir" "$global_config_dir" <<'PYTHON'
+    python3 - "$install_dir/cudo" "$scripts_dir" <<'PYTHON'
 import pathlib
 import shlex
 import sys
@@ -188,14 +196,10 @@ lines = text.splitlines(keepends=True)
 for index, line in enumerate(lines):
     if line.startswith('SCRIPT_DIR='):
         lines[index] = 'SCRIPT_DIR=' + shlex.quote(sys.argv[2]) + '\n'
-    elif line.startswith('GLOBAL_CONFIG_DIR='):
-        lines[index] = ('GLOBAL_CONFIG_DIR=${CUDO_GLOBAL_CONFIG_DIR:-'
-                        + shlex.quote(sys.argv[3]) + '}\n')
 path.write_text(''.join(lines))
 PYTHON
 
     if [ "$EUID" -eq 0 ]; then
-        chmod 777 "$global_config_dir"
         mkdir -p /usr/local/libexec
         cp "$PROJECT_ROOT/scripts/cudo-gpu-agent.py" /usr/local/libexec/cudo-gpu-agent
         chmod 755 /usr/local/libexec/cudo-gpu-agent
@@ -217,7 +221,7 @@ PYTHON
 
     log_success "Installed cudo to $install_dir"
     log_success "Support files installed to $scripts_dir"
-    log_success "Project registry directory created: $global_config_dir"
+    log_success "Each user gets a private registry on first use: ~/.local/share/cudo-global (0700)"
 }
 
 # Main installation
@@ -250,4 +254,6 @@ main() {
 }
 
 # Run main function
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
